@@ -8,7 +8,8 @@ from app.routers import inventory
 app = FastAPI(
     title="SAP B1 - ClearMechanic Middleware",
     description="Expone artículos de SAP B1 en el formato /inventoryItems de ClearMechanic",
-    version="1.2.0"
+    version="1.2.0",
+    root_path="/cm"
 )
 
 app.add_middleware(
