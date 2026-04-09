@@ -118,17 +118,31 @@ def fetch_single_item_ambas(item_code: str) -> list:
     return results
 
 
+def _keyword_conditions(keyword: str):
+    """
+    Divide el keyword en palabras y devuelve (fragment_sql, params).
+    Cada palabra genera: AND (OITM.ItemCode LIKE ? OR OITM.ItemName LIKE ?)
+    Ejemplo: "aceite 20w50"  →  AND (...LIKE '%aceite%'...) AND (...LIKE '%20w50%'...)
+    """
+    words  = keyword.split()
+    clause = " ".join(
+        "AND (OITM.ItemCode LIKE ? OR OITM.ItemName LIKE ?)" for _ in words
+    )
+    params = [p for w in words for p in (f"%{w}%", f"%{w}%")]
+    return clause, params
+
+
 def _fetch_slice(cursor, offset: int, limit: int, empresa: str, keyword: str = None) -> list:
     if limit <= 0:
         return []
 
     if keyword:
-        pattern = f"%{keyword}%"
+        kw_clause, kw_params = _keyword_conditions(keyword)
         cursor.execute(
-            _SELECT + " AND (OITM.ItemCode LIKE ? OR OITM.ItemName LIKE ?)"
+            _SELECT + f" {kw_clause}"
                       " ORDER BY OITM.ItemCode"
                       " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
-            [PRICE_LIST_CODE, pattern, pattern, offset, limit]
+            [PRICE_LIST_CODE] + kw_params + [offset, limit]
         )
     else:
         cursor.execute(
@@ -146,11 +160,14 @@ def _fetch_slice(cursor, offset: int, limit: int, empresa: str, keyword: str = N
 
 def _get_total(cursor, keyword: str = None) -> int:
     if keyword:
-        pattern = f"%{keyword}%"
+        words  = keyword.split()
+        clause = " ".join(
+            "AND (ItemCode LIKE ? OR ItemName LIKE ?)" for _ in words
+        )
+        params = [p for w in words for p in (f"%{w}%", f"%{w}%")]
         cursor.execute(
-            "SELECT COUNT(*) FROM OITM"
-            " WHERE Canceled = 'N' AND (ItemCode LIKE ? OR ItemName LIKE ?)",
-            [pattern, pattern]
+            f"SELECT COUNT(*) FROM OITM WHERE Canceled = 'N' {clause}",
+            params
         )
     else:
         cursor.execute("SELECT COUNT(*) FROM OITM WHERE Canceled = 'N'")
