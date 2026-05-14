@@ -69,7 +69,7 @@ def fetch_bps(cursor, page: int, page_size: int, keyword: Optional[str] = None):
         kw_clause, kw_params = _keyword_conditions(keyword)
         cursor.execute(
             _SELECT + f" WHERE 1=1 {kw_clause}"
-                      " ORDER BY CardCode"
+                      " ORDER BY CreateDate DESC, CardCode DESC"
                       " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             kw_params + [offset, page_size],
         )

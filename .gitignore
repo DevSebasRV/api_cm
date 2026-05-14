@@ -4,3 +4,7 @@ __pycache__/
 .env
 *.log
 .claude
+
+# Docs privadas (no se suben a git)
+*.private.md
+docs-private/
