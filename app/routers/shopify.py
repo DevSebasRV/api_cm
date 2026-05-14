@@ -24,20 +24,28 @@ router = APIRouter(prefix="/shopify", tags=["Shopify"])
 # Helpers comunes
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Si el cliente no manda X-SAP-DB usamos la base de TEST por seguridad
+# (jamás escribimos por accidente sobre producción).
+DEFAULT_DB_KEY = "test"
+
+
 def resolve_db(x_sap_db: Optional[str]) -> str:
-    """Resuelve la base SAP B1 a usar a partir del header X-SAP-DB."""
-    if not x_sap_db:
-        raise HTTPException(
-            status_code=400,
-            detail="Falta el header 'X-SAP-DB'. Valores válidos: " + ", ".join(EMPRESAS.keys()),
-        )
-    key = x_sap_db.lower()
+    """Resuelve la base SAP B1 a usar a partir del header X-SAP-DB.
+    Si no se manda el header, cae al default (`test`)."""
+    key = (x_sap_db or DEFAULT_DB_KEY).lower()
     if key not in EMPRESAS:
         raise HTTPException(
             status_code=400,
             detail=f"X-SAP-DB '{x_sap_db}' no válida. Usa: {list(EMPRESAS.keys())}.",
         )
-    return EMPRESAS[key]
+    database = EMPRESAS[key]
+    if not database:
+        raise HTTPException(
+            status_code=500,
+            detail=f"La base '{key}' no está configurada en .env "
+                   f"(falta SAP_DATABASE_{key.upper()}).",
+        )
+    return database
 
 
 def err(status: int, message: str):

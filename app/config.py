@@ -9,8 +9,9 @@ SAP_USER     = os.getenv("SAP_USER")
 SAP_PASSWORD = os.getenv("SAP_PASSWORD")
 
 EMPRESAS = {
-    "cp": os.getenv("SAP_DATABASE_CP"),
-    "fn": os.getenv("SAP_DATABASE_FN"),
+    "cp":   os.getenv("SAP_DATABASE_CP"),
+    "fn":   os.getenv("SAP_DATABASE_FN"),
+    "test": os.getenv("SAP_DATABASE_TEST"),
 }
 
 # Código de lista de precios en SAP B1
