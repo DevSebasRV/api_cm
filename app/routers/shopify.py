@@ -12,8 +12,9 @@ import pyodbc
 
 from app.config import (
     EMPRESAS,
-    SHOPIFY_VARIANT_PRICE_LIST,
     SHOPIFY_COMPARE_AT_PRICE_LIST,
+    # SHOPIFY_VARIANT_PRICE_LIST queda en config por si se reactiva,
+    # pero por ahora no se usa: Variant Price devuelve 0.0 fijo.
 )
 from app.database import get_connection
 
@@ -161,9 +162,37 @@ def get_articles(
 #    Stock por almacén, agrupado por ItemCode
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Stock agrupado por LOCATION (sucursal/agencia), no por almacén.
+# Cada OWHS pertenece a una OLCT (Locations). Sumamos el OnHand de todos
+# los almacenes que viven en la misma localidad.
+_STOCK_SELECT_SINGLE = """
+    SELECT   OITW.ItemCode,
+             COALESCE(OLCT.Location, 'SIN LOCALIDAD') AS LocationName,
+             SUM(OITW.OnHand)                          AS Stock
+    FROM     OITW
+    JOIN     OWHS ON OWHS.WhsCode = OITW.WhsCode
+    LEFT     JOIN OLCT ON OLCT.Code = OWHS.Location
+    WHERE    OITW.ItemCode = ?
+    GROUP BY OITW.ItemCode, COALESCE(OLCT.Location, 'SIN LOCALIDAD')
+    ORDER BY LocationName
+"""
+
+_STOCK_SELECT_MANY = """
+    SELECT   OITW.ItemCode,
+             COALESCE(OLCT.Location, 'SIN LOCALIDAD') AS LocationName,
+             SUM(OITW.OnHand)                          AS Stock
+    FROM     OITW
+    JOIN     OWHS ON OWHS.WhsCode = OITW.WhsCode
+    LEFT     JOIN OLCT ON OLCT.Code = OWHS.Location
+    WHERE    OITW.ItemCode IN ({placeholders})
+    GROUP BY OITW.ItemCode, COALESCE(OLCT.Location, 'SIN LOCALIDAD')
+    ORDER BY OITW.ItemCode, LocationName
+"""
+
+
 @router.get(
     "/stock",
-    summary="Stock por almacén, agrupado por artículo",
+    summary="Stock agrupado por localidad/sucursal (OLCT.Location)",
 )
 def get_stock(
     itemCode: Optional[str] = Query(default=None, description="Código exacto (OITW.ItemCode)."),
@@ -181,21 +210,12 @@ def get_stock(
 
             # ── Caso 1: un solo ItemCode ─────────────────────────────────────
             if itemCode:
-                cursor.execute(
-                    """
-                    SELECT   OITW.ItemCode, OWHS.WhsName, OITW.OnHand
-                    FROM     OITW
-                    JOIN     OWHS ON OWHS.WhsCode = OITW.WhsCode
-                    WHERE    OITW.ItemCode = ?
-                    ORDER BY OWHS.WhsName
-                    """,
-                    [itemCode],
-                )
+                cursor.execute(_STOCK_SELECT_SINGLE, [itemCode])
                 rows = cursor.fetchall()
                 if not rows:
                     return err(404, f"ItemCode '{itemCode}' no tiene registros de stock.")
                 stock[itemCode] = {
-                    r.WhsName.strip().upper(): int(r.OnHand or 0) for r in rows
+                    r.LocationName.strip().upper(): int(r.Stock or 0) for r in rows
                 }
                 return {"success": True, "message": None, "stock": stock}
 
@@ -227,21 +247,16 @@ def get_stock(
 
             placeholders = ",".join("?" * len(codes))
             cursor.execute(
-                f"""
-                SELECT   OITW.ItemCode, OWHS.WhsName, OITW.OnHand
-                FROM     OITW
-                JOIN     OWHS ON OWHS.WhsCode = OITW.WhsCode
-                WHERE    OITW.ItemCode IN ({placeholders})
-                ORDER BY OITW.ItemCode, OWHS.WhsName
-                """,
+                _STOCK_SELECT_MANY.format(placeholders=placeholders),
                 codes,
             )
 
-            # Inicializa el dict con todos los códigos vacíos
+            # Inicializa el dict con todos los códigos vacíos para que
+            # también aparezcan los items sin stock en ninguna localidad.
             for c in codes:
                 stock[c] = {}
             for r in cursor.fetchall():
-                stock[r.ItemCode][r.WhsName.strip().upper()] = int(r.OnHand or 0)
+                stock[r.ItemCode][r.LocationName.strip().upper()] = int(r.Stock or 0)
 
             return {
                 "success":    True,
@@ -266,12 +281,8 @@ def get_stock(
 _PRICES_SELECT = """
     SELECT
         OITM.ItemCode,
-        P1.Price AS VariantPrice,
         P2.Price AS CompareAtPrice
     FROM   OITM
-    LEFT   JOIN ITM1 P1
-        ON  P1.ItemCode  = OITM.ItemCode
-        AND P1.PriceList = ?
     LEFT   JOIN ITM1 P2
         ON  P2.ItemCode  = OITM.ItemCode
         AND P2.PriceList = ?
@@ -280,8 +291,13 @@ _PRICES_SELECT = """
 
 
 def _build_prices(row) -> Dict[str, Any]:
+    """
+    Variant Price queda en 0.0 hasta que definan la fuente real
+    (probablemente otra lista de precios o un cálculo aparte).
+    Compare At Price sale de la lista configurada en SHOPIFY_COMPARE_AT_PRICE_LIST.
+    """
     return {
-        "Variant Price":            float(row.VariantPrice)   if row.VariantPrice   is not None else None,
+        "Variant Price":            0.0,
         "Variant Compare At Price": float(row.CompareAtPrice) if row.CompareAtPrice is not None else None,
     }
 
@@ -298,7 +314,7 @@ def get_prices(
 ):
     database = resolve_db(x_sap_db)
 
-    base_params = [SHOPIFY_VARIANT_PRICE_LIST, SHOPIFY_COMPARE_AT_PRICE_LIST]
+    base_params = [SHOPIFY_COMPARE_AT_PRICE_LIST]
 
     try:
         conn   = get_connection(database)
