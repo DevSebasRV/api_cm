@@ -5,7 +5,7 @@ Todos los endpoints aceptan el header `X-SAP-DB` con valores fn | cp
 para seleccionar la base SAP B1 contra la que se consulta.
 """
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any
 import pyodbc
@@ -17,8 +17,15 @@ from app.config import (
     # pero por ahora no se usa: Variant Price devuelve 0.0 fijo.
 )
 from app.database import get_connection
+from app.security import require_api_key
 
-router = APIRouter(prefix="/shopify", tags=["Shopify"])
+# `dependencies=[Depends(require_api_key)]` aplica la auth a TODOS los endpoints
+# del router. Si alguien llama sin un X-API-Key válido recibe 401 / 503.
+router = APIRouter(
+    prefix="/shopify",
+    tags=["Shopify"],
+    dependencies=[Depends(require_api_key)],
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -66,39 +73,70 @@ def _pagination(page: int, page_size: int, total: int) -> Dict[str, Any]:
     }
 
 
+# Filtro central: solo artículos publicables a Shopify.
+# - U_SHOPIFY = 'Y'  → habilitado
+# - U_SHOPIFY = 'N' o NULL → bloqueado
+SHOPIFY_FLAG_WHERE = "OITM.U_SHOPIFY = 'Y'"
+
+
+def check_shopify_enabled(cursor, item_code: str):
+    """
+    Verifica que el artículo:
+      1. Exista en OITM
+      2. Tenga U_SHOPIFY = 'Y'
+
+    Devuelve None si todo OK, o un JSONResponse de error
+    (404 si no existe, 403 si existe pero no está habilitado).
+    """
+    cursor.execute(
+        "SELECT U_SHOPIFY FROM OITM WHERE ItemCode = ?",
+        [item_code],
+    )
+    row = cursor.fetchone()
+    if not row:
+        return err(404, f"ItemCode '{item_code}' no existe en OITM.")
+    flag = (row.U_SHOPIFY or "").strip().upper()
+    if flag != "Y":
+        return err(
+            403,
+            f"ItemCode '{item_code}' no está habilitado para Shopify "
+            f"(U_SHOPIFY='{flag or 'NULL'}'). Márquelo como 'Y' en SAP.",
+        )
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1) GET /shopify/articles
 #    Datos maestros de artículo + UDFs para Shopify
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ARTICLES_SELECT = """
+_ARTICLES_SELECT = f"""
     SELECT
         OITM.ItemCode,
-        OMRC.FirmName       AS Vendor,
-        OITB.ItmsGrpNam     AS ProductType,
         OITM.U_OPT1_NAME    AS Opt1Name,
         OITM.U_OPT1_VALUE   AS Opt1Value,
         OITM.U_OPT2_NAME    AS Opt2Name,
         OITM.U_OPT2_VALUE   AS Opt2Value,
-        OITM.U_OPT3_NAME    AS Opt3Name,
-        OITM.U_OPT3_VALUE   AS Opt3Value
+        OITM.U_OPT3_NAME    AS Opt3Name
     FROM   OITM
-    LEFT   JOIN OMRC ON OMRC.FirmCode    = OITM.FirmCode
-    LEFT   JOIN OITB ON OITB.ItmsGrpCod  = OITM.ItmsGrpCod
     WHERE  OITM.Canceled = 'N'
+      AND  {SHOPIFY_FLAG_WHERE}
 """
 
 
 def _build_article(row) -> Dict[str, Any]:
+    """
+    Mapeo de UDFs de OITM a los nombres que espera Shopify.
+    NOTA: vendor y type ahora salen de UDFs (U_OPT1_NAME / U_OPT1_VALUE),
+    NO de las tablas OMRC/OITB como antes.
+    El UDF U_OPT3_VALUE existe en SAP pero NO se expone en esta versión.
+    """
     return {
-        "Vendor":        row.Vendor,
-        "Type":          row.ProductType,
-        "Option1 Name":  row.Opt1Name,
-        "Option1 Value": row.Opt1Value,
-        "Option2 Name":  row.Opt2Name,
-        "Option2 Value": row.Opt2Value,
-        "Option3 Name":  row.Opt3Name,
-        "Option3 Value": row.Opt3Value,
+        "vendor":   row.Opt1Name,
+        "type":     row.Opt1Value,
+        "talla":    row.Opt2Name,
+        "material": row.Opt2Value,
+        "color":    row.Opt3Name,
     }
 
 
@@ -120,6 +158,9 @@ def get_articles(
         try:
             # ── Caso 1: un solo ItemCode ─────────────────────────────────────
             if itemCode:
+                blocked = check_shopify_enabled(cursor, itemCode)
+                if blocked:
+                    return blocked
                 cursor.execute(_ARTICLES_SELECT + " AND OITM.ItemCode = ?", [itemCode])
                 row = cursor.fetchone()
                 if not row:
@@ -131,7 +172,9 @@ def get_articles(
                 }
 
             # ── Caso 2: listado paginado ─────────────────────────────────────
-            cursor.execute("SELECT COUNT(*) FROM OITM WHERE Canceled = 'N'")
+            cursor.execute(
+                f"SELECT COUNT(*) FROM OITM WHERE Canceled = 'N' AND {SHOPIFY_FLAG_WHERE}"
+            )
             total = cursor.fetchone()[0]
 
             offset = (page - 1) * pageSize
@@ -210,6 +253,9 @@ def get_stock(
 
             # ── Caso 1: un solo ItemCode ─────────────────────────────────────
             if itemCode:
+                blocked = check_shopify_enabled(cursor, itemCode)
+                if blocked:
+                    return blocked
                 cursor.execute(_STOCK_SELECT_SINGLE, [itemCode])
                 rows = cursor.fetchall()
                 if not rows:
@@ -222,15 +268,18 @@ def get_stock(
             # ── Caso 2: listado paginado de ItemCodes ───────────────────────
             #   Para evitar joins enormes, paginamos ItemCodes y luego traemos
             #   sus filas de OITW en una segunda consulta.
-            cursor.execute("SELECT COUNT(*) FROM OITM WHERE Canceled = 'N'")
+            cursor.execute(
+                f"SELECT COUNT(*) FROM OITM WHERE Canceled = 'N' AND {SHOPIFY_FLAG_WHERE}"
+            )
             total = cursor.fetchone()[0]
 
             offset = (page - 1) * pageSize
             cursor.execute(
-                """
+                f"""
                 SELECT   ItemCode
                 FROM     OITM
                 WHERE    Canceled = 'N'
+                  AND    {SHOPIFY_FLAG_WHERE}
                 ORDER BY ItemCode
                 OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
                 """,
@@ -278,7 +327,7 @@ def get_stock(
 #    Variant Price (precio descuento) + Variant Compare At Price (lista 01)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_PRICES_SELECT = """
+_PRICES_SELECT = f"""
     SELECT
         OITM.ItemCode,
         P2.Price AS CompareAtPrice
@@ -287,18 +336,31 @@ _PRICES_SELECT = """
         ON  P2.ItemCode  = OITM.ItemCode
         AND P2.PriceList = ?
     WHERE  OITM.Canceled = 'N'
+      AND  {SHOPIFY_FLAG_WHERE}
 """
+
+
+# IVA mexicano que se aplica al "Variant Compare At Price" antes de mandarlo
+# a Shopify. SAP guarda el precio SIN IVA y Shopify lo muestra CON IVA.
+IVA_RATE = 0.16
+
+
+def _with_iva(price) -> Optional[float]:
+    """Aplica 16% de IVA y redondea a 2 decimales. Devuelve None si el precio es NULL."""
+    if price is None:
+        return None
+    return round(float(price) * (1 + IVA_RATE), 2)
 
 
 def _build_prices(row) -> Dict[str, Any]:
     """
-    Variant Price queda en 0.0 hasta que definan la fuente real
-    (probablemente otra lista de precios o un cálculo aparte).
-    Compare At Price sale de la lista configurada en SHOPIFY_COMPARE_AT_PRICE_LIST.
+    - Variant Price: queda en 0.0 hasta que definan la fuente real.
+    - Variant Compare At Price: lista configurada en SHOPIFY_COMPARE_AT_PRICE_LIST
+      multiplicada por 1.16 (IVA 16%).
     """
     return {
         "Variant Price":            0.0,
-        "Variant Compare At Price": float(row.CompareAtPrice) if row.CompareAtPrice is not None else None,
+        "Variant Compare At Price": _with_iva(row.CompareAtPrice),
     }
 
 
@@ -322,6 +384,9 @@ def get_prices(
         try:
             # ── Caso 1: un solo ItemCode ─────────────────────────────────────
             if itemCode:
+                blocked = check_shopify_enabled(cursor, itemCode)
+                if blocked:
+                    return blocked
                 cursor.execute(
                     _PRICES_SELECT + " AND OITM.ItemCode = ?",
                     base_params + [itemCode],
@@ -336,7 +401,9 @@ def get_prices(
                 }
 
             # ── Caso 2: listado paginado ─────────────────────────────────────
-            cursor.execute("SELECT COUNT(*) FROM OITM WHERE Canceled = 'N'")
+            cursor.execute(
+                f"SELECT COUNT(*) FROM OITM WHERE Canceled = 'N' AND {SHOPIFY_FLAG_WHERE}"
+            )
             total = cursor.fetchone()[0]
 
             offset = (page - 1) * pageSize
