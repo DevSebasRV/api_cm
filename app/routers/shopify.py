@@ -113,12 +113,17 @@ def check_shopify_enabled(cursor, item_code: str):
 _ARTICLES_SELECT = f"""
     SELECT
         OITM.ItemCode,
+        OMRC.FirmName       AS Vendor,
+        OITB.ItmsGrpNam     AS ProductType,
         OITM.U_OPT1_NAME    AS Opt1Name,
         OITM.U_OPT1_VALUE   AS Opt1Value,
         OITM.U_OPT2_NAME    AS Opt2Name,
         OITM.U_OPT2_VALUE   AS Opt2Value,
-        OITM.U_OPT3_NAME    AS Opt3Name
+        OITM.U_OPT3_NAME    AS Opt3Name,
+        OITM.U_OPT3_VALUE   AS Opt3Value
     FROM   OITM
+    LEFT   JOIN OMRC ON OMRC.FirmCode    = OITM.FirmCode
+    LEFT   JOIN OITB ON OITB.ItmsGrpCod  = OITM.ItmsGrpCod
     WHERE  OITM.Canceled = 'N'
       AND  {SHOPIFY_FLAG_WHERE}
 """
@@ -126,17 +131,20 @@ _ARTICLES_SELECT = f"""
 
 def _build_article(row) -> Dict[str, Any]:
     """
-    Mapeo de UDFs de OITM a los nombres que espera Shopify.
-    NOTA: vendor y type ahora salen de UDFs (U_OPT1_NAME / U_OPT1_VALUE),
-    NO de las tablas OMRC/OITB como antes.
-    El UDF U_OPT3_VALUE existe en SAP pero NO se expone en esta versión.
+    Estructura original tipo Shopify:
+      - Vendor  ← OMRC.FirmName  (fabricante en SAP)
+      - Type    ← OITB.ItmsGrpNam (grupo de artículos en SAP)
+      - Option{1,2,3} Name/Value ← UDFs U_OPT{1,2,3}_{NAME,VALUE}
     """
     return {
-        "vendor":   row.Opt1Name,
-        "type":     row.Opt1Value,
-        "talla":    row.Opt2Name,
-        "material": row.Opt2Value,
-        "color":    row.Opt3Name,
+        "Vendor":        row.Vendor,
+        "Type":          row.ProductType,
+        "Option1 Name":  row.Opt1Name,
+        "Option1 Value": row.Opt1Value,
+        "Option2 Name":  row.Opt2Name,
+        "Option2 Value": row.Opt2Value,
+        "Option3 Name":  row.Opt3Name,
+        "Option3 Value": row.Opt3Value,
     }
 
 
