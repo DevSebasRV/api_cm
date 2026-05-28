@@ -37,9 +37,10 @@ router = APIRouter(
 DEFAULT_DB_KEY = "test"
 
 
-def resolve_db(x_sap_db: Optional[str]) -> str:
+def resolve_db(x_sap_db: Optional[str]) -> tuple[str, str]:
     """Resuelve la base SAP B1 a usar a partir del header X-SAP-DB.
-    Si no se manda el header, cae al default (`test`)."""
+    Si no se manda el header, cae al default (`test`).
+    Devuelve (db_key, database_name)."""
     key = (x_sap_db or DEFAULT_DB_KEY).lower()
     if key not in EMPRESAS:
         raise HTTPException(
@@ -53,7 +54,71 @@ def resolve_db(x_sap_db: Optional[str]) -> str:
             detail=f"La base '{key}' no está configurada en .env "
                    f"(falta SAP_DATABASE_{key.upper()}).",
         )
-    return database
+    return key, database
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mapeo SAP OLCT.Location → nombre Shopify
+# ─────────────────────────────────────────────────────────────────────────────
+# Shopify exige nombres exactos: Coapa, Patriotismo, Roma, Satélite.
+# Como las sucursales en SAP difieren entre bases (FERBEL guarda "Satélite"
+# con acento, PROSHOP "Satelite" sin acento, etc.), el mapeo es por base.
+#
+# Si la misma SAP-location aparece varias veces en SQL (poco probable porque
+# ya está agregado por COALESCE/GROUP BY), el helper las suma automáticamente.
+SHOPIFY_LOCATION_MAP: Dict[str, Dict[str, str]] = {
+    "cp": {  # PROSHOP-2023
+        "Patriotismo":      "Patriotismo",
+        "Satelite":         "Satélite",
+        "Sur (Miramontes)": "Coapa",
+        # ⚠️ PROSHOP no tiene sucursal "Tonala" — Roma siempre devuelve 0.
+        # El almacén TONBOUT está mal asignado a Satelite en SAP — reportar.
+    },
+    "fn": {  # FERBEL-2023
+        "Patriotismo":      "Patriotismo",
+        "Satélite":         "Satélite",
+        "Sur (Miramontes)": "Coapa",
+        "Tonala":           "Roma",
+        "Zona Esmeralda":   "ZonaEsmeralda",
+    },
+    "test": {  # PROSHOP-TEST
+        "Patriotismo":      "Patriotismo",
+        "Satelite":         "Satélite",
+        "Sur (Miramontes)": "Coapa",
+    },
+}
+
+# Llaves que SIEMPRE deben aparecer en el JSON (aunque tengan 0 en stock).
+# Shopify espera estos 4 nombres fijos; FERBEL agrega ZonaEsmeralda como 5ª.
+SHOPIFY_REQUIRED_LOCATIONS: Dict[str, list] = {
+    "cp":   ["Coapa", "Patriotismo", "Roma", "Satélite"],
+    "fn":   ["Coapa", "Patriotismo", "Roma", "Satélite", "ZonaEsmeralda"],
+    "test": ["Coapa", "Patriotismo", "Roma", "Satélite"],
+}
+
+
+def _build_stock_for_item(rows, db_key: str) -> Dict[str, int]:
+    """
+    Convierte las filas crudas de SQL (LocationName + Stock) al dict que
+    devuelve la API, aplicando el mapeo SAP→Shopify y garantizando que las
+    llaves requeridas estén presentes (con 0 si no hay stock).
+    """
+    location_map  = SHOPIFY_LOCATION_MAP.get(db_key, {})
+    required_keys = SHOPIFY_REQUIRED_LOCATIONS.get(db_key, [])
+
+    # 1. Inicializa con todas las llaves requeridas en 0
+    result: Dict[str, int] = {k: 0 for k in required_keys}
+
+    # 2. Suma stock por mapeo (SAP location → Shopify name)
+    for r in rows:
+        sap_location = (r.LocationName or "").strip()
+        shopify_name = location_map.get(sap_location)
+        if not shopify_name:
+            # SAP location no mapeada → se ignora silenciosamente
+            continue
+        result[shopify_name] = result.get(shopify_name, 0) + int(r.Stock or 0)
+
+    return result
 
 
 def err(status: int, message: str):
@@ -73,34 +138,31 @@ def _pagination(page: int, page_size: int, total: int) -> Dict[str, Any]:
     }
 
 
-# Filtro central: solo artículos publicables a Shopify.
-# - U_SHOPIFY = 'Y'  → habilitado
-# - U_SHOPIFY = 'N' o NULL → bloqueado
-SHOPIFY_FLAG_WHERE = "OITM.U_SHOPIFY = 'Y'"
+# Filtro central: existencia en la UDT @SHOPIFY_ARTICLE con U_Activo='Y'.
+# Los artículos NO viven en OITM filtrados por una bandera — viven en una
+# tabla aparte, gestionable desde Retool/SQL.
+SHOPIFY_GATE_WHERE = "ISNULL(U_Activo, 'Y') = 'Y'"
 
 
 def check_shopify_enabled(cursor, item_code: str):
     """
     Verifica que el artículo:
-      1. Exista en OITM
-      2. Tenga U_SHOPIFY = 'Y'
+      1. Exista en [@SHOPIFY_ARTICLE]
+      2. Tenga U_Activo distinto de 'N'
 
     Devuelve None si todo OK, o un JSONResponse de error
-    (404 si no existe, 403 si existe pero no está habilitado).
+    (403 si no está publicable).
     """
     cursor.execute(
-        "SELECT U_SHOPIFY FROM OITM WHERE ItemCode = ?",
+        f"SELECT 1 FROM [@SHOPIFY_ARTICLE] "
+        f"WHERE Code = ? AND {SHOPIFY_GATE_WHERE}",
         [item_code],
     )
-    row = cursor.fetchone()
-    if not row:
-        return err(404, f"ItemCode '{item_code}' no existe en OITM.")
-    flag = (row.U_SHOPIFY or "").strip().upper()
-    if flag != "Y":
+    if not cursor.fetchone():
         return err(
             403,
-            f"ItemCode '{item_code}' no está habilitado para Shopify "
-            f"(U_SHOPIFY='{flag or 'NULL'}'). Márquelo como 'Y' en SAP.",
+            f"ItemCode '{item_code}' no es publicable en Shopify "
+            f"(no existe en @SHOPIFY_ARTICLE o U_Activo='N').",
         )
     return None
 
@@ -110,41 +172,45 @@ def check_shopify_enabled(cursor, item_code: str):
 #    Datos maestros de artículo + UDFs para Shopify
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ARTICLES_SELECT = f"""
+_ARTICLES_SELECT = """
     SELECT
-        OITM.ItemCode,
-        OMRC.FirmName       AS Vendor,
-        OITB.ItmsGrpNam     AS ProductType,
-        OITM.U_OPT1_NAME    AS Opt1Name,
-        OITM.U_OPT1_VALUE   AS Opt1Value,
-        OITM.U_OPT2_NAME    AS Opt2Name,
-        OITM.U_OPT2_VALUE   AS Opt2Value,
-        OITM.U_OPT3_NAME    AS Opt3Name,
-        OITM.U_OPT3_VALUE   AS Opt3Value
-    FROM   OITM
-    LEFT   JOIN OMRC ON OMRC.FirmCode    = OITM.FirmCode
-    LEFT   JOIN OITB ON OITB.ItmsGrpCod  = OITM.ItmsGrpCod
-    WHERE  OITM.Canceled = 'N'
-      AND  {SHOPIFY_FLAG_WHERE}
+        Code         AS ItemCode,
+        Name         AS ItemName,
+        U_Activo     AS Activo,
+        U_Vendor     AS Vendor,
+        U_Type       AS ProductType,
+        U_Opt1Name   AS Opt1Name,
+        U_Opt1Value  AS Opt1Value,
+        U_Opt2Name   AS Opt2Name,
+        U_Opt2Value  AS Opt2Value,
+        U_Opt3Name   AS Opt3Name,
+        U_Opt3Value  AS Opt3Value
+    FROM   [@SHOPIFY_ARTICLE]
 """
+
+
+def _activo_to_status(flag: Optional[str]) -> str:
+    """Convierte el flag U_Activo de SAP (Y/N/NULL) al string visible Activa/Inactiva."""
+    return "Activa" if (flag or "Y").strip().upper() == "Y" else "Inactiva"
 
 
 def _build_article(row) -> Dict[str, Any]:
     """
-    Estructura original tipo Shopify:
-      - Vendor  ← OMRC.FirmName  (fabricante en SAP)
-      - Type    ← OITB.ItmsGrpNam (grupo de artículos en SAP)
-      - Option{1,2,3} Name/Value ← UDFs U_OPT{1,2,3}_{NAME,VALUE}
+    Toda la data sale de la UDT @SHOPIFY_ARTICLE.
+    Las llaves van sin espacios (Option1Name en vez de "Option1 Name") para
+    facilitar el consumo desde código (acceso por atributo / destructuring).
     """
     return {
+        "Name":          row.ItemName,
+        "Status":        _activo_to_status(row.Activo),
         "Vendor":        row.Vendor,
         "Type":          row.ProductType,
-        "Option1 Name":  row.Opt1Name,
-        "Option1 Value": row.Opt1Value,
-        "Option2 Name":  row.Opt2Name,
-        "Option2 Value": row.Opt2Value,
-        "Option3 Name":  row.Opt3Name,
-        "Option3 Value": row.Opt3Value,
+        "Option1Name":   row.Opt1Name,
+        "Option1Value":  row.Opt1Value,
+        "Option2Name":   row.Opt2Name,
+        "Option2Value":  row.Opt2Value,
+        "Option3Name":   row.Opt3Name,
+        "Option3Value":  row.Opt3Value,
     }
 
 
@@ -158,37 +224,37 @@ def get_articles(
     pageSize: int           = Query(default=100, ge=1, le=2000),
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
 ):
-    database = resolve_db(x_sap_db)
+    _, database = resolve_db(x_sap_db)
 
     try:
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
             # ── Caso 1: un solo ItemCode ─────────────────────────────────────
+            # Devolvemos el item EXISTA O NO sea activo — el campo Status
+            # indica al consumer si está Activa/Inactiva.
             if itemCode:
-                blocked = check_shopify_enabled(cursor, itemCode)
-                if blocked:
-                    return blocked
-                cursor.execute(_ARTICLES_SELECT + " AND OITM.ItemCode = ?", [itemCode])
+                cursor.execute(_ARTICLES_SELECT + " WHERE Code = ?", [itemCode])
                 row = cursor.fetchone()
                 if not row:
-                    return err(404, f"ItemCode '{itemCode}' no encontrado.")
+                    return err(
+                        404,
+                        f"ItemCode '{itemCode}' no existe en @SHOPIFY_ARTICLE.",
+                    )
                 return {
                     "success":  True,
                     "message":  None,
                     "articles": { row.ItemCode: _build_article(row) },
                 }
 
-            # ── Caso 2: listado paginado ─────────────────────────────────────
-            cursor.execute(
-                f"SELECT COUNT(*) FROM OITM WHERE Canceled = 'N' AND {SHOPIFY_FLAG_WHERE}"
-            )
+            # ── Caso 2: listado paginado (activos + inactivos) ─────────────
+            cursor.execute("SELECT COUNT(*) FROM [@SHOPIFY_ARTICLE]")
             total = cursor.fetchone()[0]
 
             offset = (page - 1) * pageSize
             cursor.execute(
                 _ARTICLES_SELECT
-                + " ORDER BY OITM.ItemCode OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+                + " ORDER BY Code OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
                 [offset, pageSize],
             )
             articles = { row.ItemCode: _build_article(row) for row in cursor.fetchall() }
@@ -251,7 +317,7 @@ def get_stock(
     pageSize: int           = Query(default=100, ge=1, le=2000),
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
 ):
-    database = resolve_db(x_sap_db)
+    db_key, database = resolve_db(x_sap_db)
 
     try:
         conn   = get_connection(database)
@@ -266,29 +332,26 @@ def get_stock(
                     return blocked
                 cursor.execute(_STOCK_SELECT_SINGLE, [itemCode])
                 rows = cursor.fetchall()
-                if not rows:
-                    return err(404, f"ItemCode '{itemCode}' no tiene registros de stock.")
-                stock[itemCode] = {
-                    r.LocationName.strip().upper(): int(r.Stock or 0) for r in rows
-                }
+                # Aunque no haya filas, devolvemos las 4 llaves requeridas en 0
+                # (el item ya pasó check_shopify_enabled, así que es válido).
+                stock[itemCode] = _build_stock_for_item(rows, db_key)
                 return {"success": True, "message": None, "stock": stock}
 
             # ── Caso 2: listado paginado de ItemCodes ───────────────────────
-            #   Para evitar joins enormes, paginamos ItemCodes y luego traemos
-            #   sus filas de OITW en una segunda consulta.
+            #   Para evitar joins enormes, paginamos ItemCodes desde la UDT y
+            #   luego traemos sus filas de OITW en una segunda consulta.
             cursor.execute(
-                f"SELECT COUNT(*) FROM OITM WHERE Canceled = 'N' AND {SHOPIFY_FLAG_WHERE}"
+                f"SELECT COUNT(*) FROM [@SHOPIFY_ARTICLE] WHERE {SHOPIFY_GATE_WHERE}"
             )
             total = cursor.fetchone()[0]
 
             offset = (page - 1) * pageSize
             cursor.execute(
                 f"""
-                SELECT   ItemCode
-                FROM     OITM
-                WHERE    Canceled = 'N'
-                  AND    {SHOPIFY_FLAG_WHERE}
-                ORDER BY ItemCode
+                SELECT   Code AS ItemCode
+                FROM     [@SHOPIFY_ARTICLE]
+                WHERE    {SHOPIFY_GATE_WHERE}
+                ORDER BY Code
                 OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
                 """,
                 [offset, pageSize],
@@ -308,12 +371,17 @@ def get_stock(
                 codes,
             )
 
-            # Inicializa el dict con todos los códigos vacíos para que
-            # también aparezcan los items sin stock en ninguna localidad.
-            for c in codes:
-                stock[c] = {}
+            # Agrupar las filas de stock por ItemCode
+            rows_by_item: Dict[str, list] = {c: [] for c in codes}
             for r in cursor.fetchall():
-                stock[r.ItemCode][r.LocationName.strip().upper()] = int(r.Stock or 0)
+                rows_by_item.setdefault(r.ItemCode, []).append(r)
+
+            # Construir el dict final: todos los códigos llevan las llaves
+            # requeridas (con 0 si no tienen stock en esa sucursal).
+            stock = {
+                code: _build_stock_for_item(rows_by_item.get(code, []), db_key)
+                for code in codes
+            }
 
             return {
                 "success":    True,
@@ -337,14 +405,13 @@ def get_stock(
 
 _PRICES_SELECT = f"""
     SELECT
-        OITM.ItemCode,
+        SA.Code  AS ItemCode,
         P2.Price AS CompareAtPrice
-    FROM   OITM
+    FROM   [@SHOPIFY_ARTICLE] SA
     LEFT   JOIN ITM1 P2
-        ON  P2.ItemCode  = OITM.ItemCode
+        ON  P2.ItemCode  = SA.Code
         AND P2.PriceList = ?
-    WHERE  OITM.Canceled = 'N'
-      AND  {SHOPIFY_FLAG_WHERE}
+    WHERE  {SHOPIFY_GATE_WHERE.replace("U_Activo", "SA.U_Activo")}
 """
 
 
@@ -362,13 +429,14 @@ def _with_iva(price) -> Optional[float]:
 
 def _build_prices(row) -> Dict[str, Any]:
     """
-    - Variant Price: queda en 0.0 hasta que definan la fuente real.
-    - Variant Compare At Price: lista configurada en SHOPIFY_COMPARE_AT_PRICE_LIST
+    - VariantPrice: queda en 0.0 hasta que definan la fuente real.
+    - VariantCompareAtPrice: lista configurada en SHOPIFY_COMPARE_AT_PRICE_LIST
       multiplicada por 1.16 (IVA 16%).
+    Las llaves van sin espacios (PascalCase) para facilitar el consumo.
     """
     return {
-        "Variant Price":            0.0,
-        "Variant Compare At Price": _with_iva(row.CompareAtPrice),
+        "VariantPrice":            0.0,
+        "VariantCompareAtPrice":   _with_iva(row.CompareAtPrice),
     }
 
 
@@ -382,7 +450,7 @@ def get_prices(
     pageSize: int           = Query(default=100, ge=1, le=2000),
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
 ):
-    database = resolve_db(x_sap_db)
+    _, database = resolve_db(x_sap_db)
 
     base_params = [SHOPIFY_COMPARE_AT_PRICE_LIST]
 
@@ -392,16 +460,17 @@ def get_prices(
         try:
             # ── Caso 1: un solo ItemCode ─────────────────────────────────────
             if itemCode:
-                blocked = check_shopify_enabled(cursor, itemCode)
-                if blocked:
-                    return blocked
                 cursor.execute(
-                    _PRICES_SELECT + " AND OITM.ItemCode = ?",
+                    _PRICES_SELECT + " AND SA.Code = ?",
                     base_params + [itemCode],
                 )
                 row = cursor.fetchone()
                 if not row:
-                    return err(404, f"ItemCode '{itemCode}' no encontrado.")
+                    return err(
+                        404,
+                        f"ItemCode '{itemCode}' no existe en @SHOPIFY_ARTICLE "
+                        f"o tiene U_Activo='N'.",
+                    )
                 return {
                     "success": True,
                     "message": None,
@@ -410,14 +479,14 @@ def get_prices(
 
             # ── Caso 2: listado paginado ─────────────────────────────────────
             cursor.execute(
-                f"SELECT COUNT(*) FROM OITM WHERE Canceled = 'N' AND {SHOPIFY_FLAG_WHERE}"
+                f"SELECT COUNT(*) FROM [@SHOPIFY_ARTICLE] WHERE {SHOPIFY_GATE_WHERE}"
             )
             total = cursor.fetchone()[0]
 
             offset = (page - 1) * pageSize
             cursor.execute(
                 _PRICES_SELECT
-                + " ORDER BY OITM.ItemCode OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+                + " ORDER BY SA.Code OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
                 base_params + [offset, pageSize],
             )
             prices = { row.ItemCode: _build_prices(row) for row in cursor.fetchall() }
