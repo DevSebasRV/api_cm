@@ -313,7 +313,7 @@ def create_article(
 ):
     if not payload.code:
         return err(400, "El campo 'code' (SKU) es requerido.")
-    database = resolve_db(x_sap_db)
+    _, database = resolve_db(x_sap_db)
     try:
         conn   = get_connection(database)
         cursor = conn.cursor()
@@ -366,7 +366,7 @@ def update_article(
     payload: ArticleIn,
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
 ):
-    database = resolve_db(x_sap_db)
+    _, database = resolve_db(x_sap_db)
     try:
         conn   = get_connection(database)
         cursor = conn.cursor()
@@ -423,7 +423,7 @@ def delete_article(
     code: str,
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
 ):
-    database = resolve_db(x_sap_db)
+    _, database = resolve_db(x_sap_db)
     try:
         conn   = get_connection(database)
         cursor = conn.cursor()
