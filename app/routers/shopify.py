@@ -275,6 +275,174 @@ def get_articles(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 1b) POST / PATCH / DELETE /shopify/articles  — escritura a la UDT
+#     SAP B1 Service Layer NO expone las UDTs como servicio por defecto
+#     (requiere registrarlas como UDO). Para evitar ese paso, escribimos
+#     SQL directo con pyodbc. Misma transacción, misma BD.
+# ─────────────────────────────────────────────────────────────────────────────
+
+from pydantic import BaseModel, Field as PydField  # noqa: E402
+
+
+class ArticleIn(BaseModel):
+    """
+    Payload de create/update.
+    - `code` (PK) requerido en POST, opcional en PATCH (va en la URL)
+    - El resto opcional — cualquier campo `None` no se toca en UPDATE
+    """
+    code:       Optional[str] = PydField(None, max_length=50)
+    name:       Optional[str] = PydField(None, max_length=100)
+    vendor:     Optional[str] = PydField(None, max_length=100)
+    type:       Optional[str] = PydField(None, max_length=100)
+    opt1Name:   Optional[str] = PydField(None, max_length=50)
+    opt1Value:  Optional[str] = PydField(None, max_length=50)
+    opt2Name:   Optional[str] = PydField(None, max_length=50)
+    opt2Value:  Optional[str] = PydField(None, max_length=50)
+    opt3Name:   Optional[str] = PydField(None, max_length=50)
+    opt3Value:  Optional[str] = PydField(None, max_length=50)
+    activo:     Optional[str] = PydField(None, pattern=r"^[YN]$")
+
+
+@router.post(
+    "/articles",
+    summary="Crea un artículo en la UDT @SHOPIFY_ARTICLE",
+)
+def create_article(
+    payload: ArticleIn,
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    if not payload.code:
+        return err(400, "El campo 'code' (SKU) es requerido.")
+    database = resolve_db(x_sap_db)
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            # Verificar que no exista
+            cursor.execute("SELECT 1 FROM [@SHOPIFY_ARTICLE] WHERE Code = ?", [payload.code])
+            if cursor.fetchone():
+                return err(409, f"Ya existe un artículo con SKU '{payload.code}'.")
+
+            cursor.execute(
+                """
+                INSERT INTO [@SHOPIFY_ARTICLE]
+                       (Code, Name, U_Vendor, U_Type,
+                        U_Opt1Name, U_Opt1Value,
+                        U_Opt2Name, U_Opt2Value,
+                        U_Opt3Name, U_Opt3Value, U_Activo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    payload.code,
+                    payload.name      or None,
+                    payload.vendor    or None,
+                    payload.type      or None,
+                    payload.opt1Name  or None,
+                    payload.opt1Value or None,
+                    payload.opt2Name  or None,
+                    payload.opt2Value or None,
+                    payload.opt3Name  or None,
+                    payload.opt3Value or None,
+                    (payload.activo or "Y").upper(),
+                ],
+            )
+            conn.commit()
+            return {"success": True, "message": None, "code": payload.code}
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
+@router.patch(
+    "/articles/{code}",
+    summary="Actualiza un artículo (solo los campos enviados)",
+)
+def update_article(
+    code:    str,
+    payload: ArticleIn,
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    database = resolve_db(x_sap_db)
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT 1 FROM [@SHOPIFY_ARTICLE] WHERE Code = ?", [code])
+            if not cursor.fetchone():
+                return err(404, f"No existe artículo con SKU '{code}'.")
+
+            # Construir SET dinámico: solo campos NO-None
+            sets:   list[str] = []
+            params: list[Any] = []
+            mapping = [
+                ("Name",        payload.name),
+                ("U_Vendor",    payload.vendor),
+                ("U_Type",      payload.type),
+                ("U_Opt1Name",  payload.opt1Name),
+                ("U_Opt1Value", payload.opt1Value),
+                ("U_Opt2Name",  payload.opt2Name),
+                ("U_Opt2Value", payload.opt2Value),
+                ("U_Opt3Name",  payload.opt3Name),
+                ("U_Opt3Value", payload.opt3Value),
+                ("U_Activo",    payload.activo.upper() if payload.activo else None),
+            ]
+            for col, val in mapping:
+                if val is not None:
+                    sets.append(f"{col} = ?")
+                    # Strings vacíos → NULL para no ensuciar la tabla
+                    params.append(val if val != "" else None)
+
+            if not sets:
+                return err(400, "No se mandó ningún campo para actualizar.")
+
+            params.append(code)
+            cursor.execute(
+                f"UPDATE [@SHOPIFY_ARTICLE] SET {', '.join(sets)} WHERE Code = ?",
+                params,
+            )
+            conn.commit()
+            return {"success": True, "message": None, "code": code}
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
+@router.delete(
+    "/articles/{code}",
+    summary="Elimina un artículo (hard delete). Para soft-delete usar PATCH con activo=N.",
+)
+def delete_article(
+    code: str,
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    database = resolve_db(x_sap_db)
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM [@SHOPIFY_ARTICLE] WHERE Code = ?", [code])
+            if cursor.rowcount == 0:
+                return err(404, f"No existe artículo con SKU '{code}'.")
+            conn.commit()
+            return {"success": True, "message": None, "code": code}
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 2) GET /shopify/stock
 #    Stock por almacén, agrupado por ItemCode
 # ─────────────────────────────────────────────────────────────────────────────
