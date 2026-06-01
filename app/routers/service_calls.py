@@ -420,14 +420,26 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
 SERVICE_CALL_OBJTYPE = 191    # ObjType de ServiceCalls en SAP B1
 
 
-def _fetch_related_documents(cursor, call_id: int) -> Dict[str, List[Dict[str, Any]]]:
+def _fetch_related_documents(
+    cursor,
+    call_id:     int,
+    card_code:   Optional[str],
+    create_date: Optional[Any],
+    close_date:  Optional[Any],
+) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Busca documentos generados desde una llamada de servicio.
-    SAP marca cada LÍNEA del documento destino con BaseType + BaseEntry
-    apuntando al origen. Para Service Calls: BaseType = 191, BaseEntry = CallID.
+    Busca documentos relacionados con la orden de servicio combinando dos
+    mecanismos:
 
-    Iteramos las 4 tablas hijas (QUT1, RDR1, DLN1, INV1), sacamos los DocEntry
-    distintos, y traemos cada documento completo.
+    1.  Linkage estándar SAP B1 — busca líneas en QUT1/RDR1/DLN1/INV1 con
+        BaseType=191 y BaseEntry=CallID. Funciona cuando se crearon los docs
+        directamente desde la pestaña "Registr y Refacciones" de SAP.
+
+    2.  Heurística por cliente + fechas — si el linkage estándar no encuentra
+        nada (caso típico en Ferbel donde los docs se crean por otros flujos),
+        busca docs del MISMO cliente con DocDate entre createDate y closeDate.
+
+    Los documentos se devuelven sin duplicados (vía set de (obj_type, doc_entry)).
     """
     grouped: Dict[str, List[Dict[str, Any]]] = {
         "Oferta":  [],
@@ -435,16 +447,18 @@ def _fetch_related_documents(cursor, call_id: int) -> Dict[str, List[Dict[str, A
         "Entrega": [],
         "Factura": [],
     }
+    seen: set = set()
 
-    # (obj_type del documento DESTINO, tabla de líneas)
-    line_tables = [
-        (23, "QUT1", "Oferta"),
-        (17, "RDR1", "Pedido"),
-        (15, "DLN1", "Entrega"),
-        (13, "INV1", "Factura"),
+    # (obj_type, tabla líneas, tabla cabecera, label)
+    doc_specs = [
+        (23, "QUT1", "OQUT", "Oferta"),
+        (17, "RDR1", "ORDR", "Pedido"),
+        (15, "DLN1", "ODLN", "Entrega"),
+        (13, "INV1", "OINV", "Factura"),
     ]
 
-    for obj_type, line_table, type_label in line_tables:
+    # ── Mecanismo 1: BaseType=191 en líneas (linkage estándar SAP) ──────────
+    for obj_type, line_table, _, type_label in doc_specs:
         try:
             cursor.execute(
                 f"""
@@ -454,15 +468,45 @@ def _fetch_related_documents(cursor, call_id: int) -> Dict[str, List[Dict[str, A
                 """,
                 [SERVICE_CALL_OBJTYPE, call_id],
             )
-            entries = [int(r.DocEntry) for r in cursor.fetchall()]
+            for r in cursor.fetchall():
+                key = (obj_type, int(r.DocEntry))
+                if key in seen:
+                    continue
+                doc = _fetch_document(cursor, obj_type, int(r.DocEntry))
+                if doc:
+                    grouped[type_label].append(doc)
+                    seen.add(key)
         except pyodbc.Error:
-            # Si la tabla no tiene la columna o falla, ignora
-            entries = []
+            pass
 
-        for doc_entry in entries:
-            doc = _fetch_document(cursor, obj_type, doc_entry)
-            if doc:
-                grouped[type_label].append(doc)
+    # ── Mecanismo 2: Heurística por cliente + fechas ────────────────────────
+    if card_code and create_date is not None:
+        # Si la orden está abierta (sin closeDate), usamos createDate como tope.
+        date_to = close_date if close_date is not None else create_date
+
+        for obj_type, _, head_table, type_label in doc_specs:
+            try:
+                cursor.execute(
+                    f"""
+                    SELECT DocEntry
+                    FROM   {head_table}
+                    WHERE  CardCode = ?
+                      AND  DocDate >= ?
+                      AND  DocDate <= ?
+                    ORDER BY DocEntry
+                    """,
+                    [card_code, create_date, date_to],
+                )
+                for r in cursor.fetchall():
+                    key = (obj_type, int(r.DocEntry))
+                    if key in seen:
+                        continue
+                    doc = _fetch_document(cursor, obj_type, int(r.DocEntry))
+                    if doc:
+                        grouped[type_label].append(doc)
+                        seen.add(key)
+            except pyodbc.Error:
+                pass
 
     return grouped
 
@@ -494,8 +538,15 @@ def get_service_call(
             # 3. Refacciones / gastos (SCL3)
             refacciones = _fetch_refacciones(cursor, call_id)
 
-            # 4. Documentos vinculados — buscados vía BaseType=191 en líneas
-            documents = _fetch_related_documents(cursor, call_id)
+            # 4. Documentos vinculados — usa linkage estándar + heurística
+            #    por cliente y rango de fechas (para SAP custom como Ferbel).
+            documents = _fetch_related_documents(
+                cursor,
+                call_id,
+                h.CardCode,
+                h.createDate,
+                h.closeDate,
+            )
 
             return {
                 "success":     True,
