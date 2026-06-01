@@ -149,7 +149,7 @@ def list_service_calls(
         words = keyword.split()
         for w in words:
             where_parts.append(
-                "(OSCL.Subject LIKE ? OR OSCL.customerName LIKE ? "
+                "(OSCL.subject LIKE ? OR OSCL.custmrName LIKE ? "
                 "OR OSCL.itemCode LIKE ? OR OSCL.itemName LIKE ?)"
             )
             like = f"%{w}%"
