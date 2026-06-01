@@ -83,9 +83,9 @@ _LIST_SELECT = """
     SELECT  OSCL.CallID,
             OSCL.Subject,
             OSCL.customer       AS CardCode,
-            OSCL.customerName,
+            OCRD.CardName       AS CustomerName,
             OSCL.itemCode,
-            OSCL.itemName,
+            OITM.ItemName       AS ItemName,
             OSCL.status,
             OSCS.Name           AS StatusName,
             OSCL.priority,
@@ -94,8 +94,10 @@ _LIST_SELECT = """
             OSCL.closeDate,
             OHEM.firstName + ISNULL(' ' + OHEM.lastName, '') AS Tecnico
     FROM    OSCL
-    LEFT    JOIN OSCS ON OSCS.statusID = OSCL.status
-    LEFT    JOIN OHEM ON OHEM.empID    = OSCL.assignee
+    LEFT    JOIN OCRD ON OCRD.CardCode  = OSCL.customer
+    LEFT    JOIN OITM ON OITM.ItemCode  = OSCL.itemCode
+    LEFT    JOIN OSCS ON OSCS.statusID  = OSCL.status
+    LEFT    JOIN OHEM ON OHEM.empID     = OSCL.assignee
 """
 
 
@@ -105,9 +107,9 @@ def _build_list_row(r) -> Dict[str, Any]:
         "CallID":        int(r.CallID),
         "Subject":       r.Subject,
         "CardCode":      r.CardCode,
-        "CustomerName":  r.customerName,
+        "CustomerName":  r.CustomerName,
         "ItemCode":      r.itemCode,
-        "ItemName":      r.itemName,
+        "ItemName":      r.ItemName,
         "Status":        status_code,
         # Si OSCS no devuelve un nombre (estado custom sin descripción), cae al map estándar
         "StatusName":    r.StatusName or _status_label(status_code),
@@ -194,14 +196,12 @@ _DETAIL_HEADER = """
     SELECT  OSCL.CallID,
             OSCL.Subject,
             OSCL.customer       AS CardCode,
-            OSCL.customerName,
             OSCL.contctPrsn,
             OSCL.Telephone,
             OSCL.manufactSN,
             OSCL.internalSN,
             OSCL.insID,
             OSCL.itemCode,
-            OSCL.itemName,
             OSCL.contractID,
             OSCL.status,
             OSCL.priority,
@@ -248,7 +248,7 @@ def _build_header(r) -> Dict[str, Any]:
         "Resolution":       r.resolution,
         "Customer": {
             "CardCode":     r.CardCode,
-            "CardName":     r.CustomerCardName or r.customerName,
+            "CardName":     r.CustomerCardName,
             "Phone":        r.CustomerPhone,
             "Email":        r.CustomerEmail,
             "ContactName":  r.contctPrsn,
@@ -257,7 +257,7 @@ def _build_header(r) -> Dict[str, Any]:
         "Equipment": {
             "InsID":        int(r.insID) if r.insID else None,
             "ItemCode":     r.itemCode,
-            "ItemName":     r.ItemFullName or r.itemName,
+            "ItemName":     r.ItemFullName,
             "ManufSN":      r.EquipManufSN or r.manufactSN,
             "InternalSN":   r.EquipInternalSN or r.internalSN,
         },
