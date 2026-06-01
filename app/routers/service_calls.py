@@ -280,71 +280,65 @@ def _build_header(r) -> Dict[str, Any]:
     }
 
 
-def _fetch_activities(cursor, call_id: int) -> List[Dict[str, Any]]:
+def _fetch_solutions(cursor, call_id: int) -> List[Dict[str, Any]]:
+    """SCL1 = Soluciones aplicadas (NO actividades). Solo tiene FK a OSCT (knowledge base)."""
     cursor.execute(
         """
-        SELECT  SCL1.LineID,
-                SCL1.clgCode,
-                SCL1.actDate,
-                SCL1.endDate,
-                SCL1.assignedTo,
-                OHEM.firstName + ISNULL(' ' + OHEM.lastName, '') AS Tecnico,
-                OCLG.Notes
+        SELECT  SCL1.line       AS LineID,
+                SCL1.solutionID,
+                SCL1.createDate
         FROM    SCL1
-        LEFT    JOIN OCLG ON OCLG.ClgCode  = SCL1.clgCode
-        LEFT    JOIN OHEM ON OHEM.empID    = SCL1.assignedTo
-        WHERE   SCL1.callID = ?
-        ORDER BY SCL1.LineID
+        WHERE   SCL1.srvcCallID = ?
+        ORDER BY SCL1.line
         """,
         [call_id],
     )
     return [
         {
             "LineID":     int(r.LineID),
-            "ClgCode":    int(r.clgCode) if r.clgCode else None,
-            "ActDate":    r.actDate.isoformat() if r.actDate else None,
-            "EndDate":    r.endDate.isoformat() if r.endDate else None,
-            "AssignedTo": int(r.assignedTo) if r.assignedTo else None,
-            "Tecnico":    (r.Tecnico or "").strip() or None,
-            "Notes":      r.Notes,
+            "SolutionID": int(r.solutionID) if r.solutionID is not None else None,
+            "CreateDate": r.createDate.isoformat() if r.createDate else None,
         }
         for r in cursor.fetchall()
     ]
 
 
 def _fetch_refacciones(cursor, call_id: int) -> List[Dict[str, Any]]:
+    """
+    SCL3 en esta BD no tiene Price/WhsCode/DocEntry/ObjType — solo ItemCode,
+    cantidades y horas. Es básicamente "lo que se pidió" para la llamada.
+    Los datos de facturación/almacén/precio vienen de los DOCUMENTOS vinculados.
+    """
     cursor.execute(
         """
-        SELECT  SCL3.LineID,
+        SELECT  SCL3.Line        AS LineID,
                 SCL3.ItemCode,
-                OITM.ItemName,
+                SCL3.ItemName,
                 SCL3.Quantity,
-                SCL3.WhsCode,
-                OWHS.WhsName,
-                SCL3.Price,
-                SCL3.ObjType,
-                SCL3.DocEntry
+                SCL3.QtyToBill,
+                SCL3.QtyToInv,
+                SCL3.Bill,
+                SCL3.HourFrom,
+                SCL3.HourTo,
+                SCL3.SaleUnits
         FROM    SCL3
-        LEFT    JOIN OITM ON OITM.ItemCode = SCL3.ItemCode
-        LEFT    JOIN OWHS ON OWHS.WhsCode  = SCL3.WhsCode
-        WHERE   SCL3.callID = ?
-        ORDER BY SCL3.LineID
+        WHERE   SCL3.SrcvCallID = ?
+        ORDER BY SCL3.Line
         """,
         [call_id],
     )
     return [
         {
-            "LineID":   int(r.LineID),
-            "ItemCode": r.ItemCode,
-            "ItemName": r.ItemName,
-            "Quantity": float(r.Quantity) if r.Quantity is not None else 0.0,
-            "WhsCode":  r.WhsCode,
-            "WhsName":  r.WhsName,
-            "Price":    float(r.Price) if r.Price is not None else 0.0,
-            "Total":    float((r.Quantity or 0) * (r.Price or 0)),
-            "ObjType":  int(r.ObjType) if r.ObjType is not None else None,
-            "DocEntry": int(r.DocEntry) if r.DocEntry is not None else None,
-            "DocLabel": OBJ_TYPE_MAP.get(int(r.ObjType), str(r.ObjType)) if r.ObjType else None,
+            "LineID":     int(r.LineID),
+            "ItemCode":   r.ItemCode,
+            "ItemName":   r.ItemName,
+            "Quantity":   float(r.Quantity)  if r.Quantity  is not None else 0.0,
+            "QtyToBill":  float(r.QtyToBill) if r.QtyToBill is not None else 0.0,
+            "QtyToInv":   float(r.QtyToInv)  if r.QtyToInv  is not None else 0.0,
+            "Bill":       r.Bill,
+            "HourFrom":   int(r.HourFrom) if r.HourFrom is not None else None,
+            "HourTo":     int(r.HourTo)   if r.HourTo   is not None else None,
+            "SaleUnits":  r.SaleUnits,
         }
         for r in cursor.fetchall()
     ]
@@ -423,31 +417,52 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
     }
 
 
+SERVICE_CALL_OBJTYPE = 191    # ObjType de ServiceCalls en SAP B1
+
+
 def _fetch_related_documents(cursor, call_id: int) -> Dict[str, List[Dict[str, Any]]]:
     """
-    De SCL3 saca todos los (ObjType, DocEntry) únicos, los agrupa por tipo
-    y trae la cabecera + líneas de cada documento de su tabla real.
-    """
-    cursor.execute(
-        """
-        SELECT DISTINCT ObjType, DocEntry
-        FROM   SCL3
-        WHERE  callID = ? AND ObjType IS NOT NULL AND DocEntry IS NOT NULL
-        """,
-        [call_id],
-    )
-    unique_refs = [(int(r.ObjType), int(r.DocEntry)) for r in cursor.fetchall()]
+    Busca documentos generados desde una llamada de servicio.
+    SAP marca cada LÍNEA del documento destino con BaseType + BaseEntry
+    apuntando al origen. Para Service Calls: BaseType = 191, BaseEntry = CallID.
 
+    Iteramos las 4 tablas hijas (QUT1, RDR1, DLN1, INV1), sacamos los DocEntry
+    distintos, y traemos cada documento completo.
+    """
     grouped: Dict[str, List[Dict[str, Any]]] = {
         "Oferta":  [],
         "Pedido":  [],
         "Entrega": [],
         "Factura": [],
     }
-    for obj_type, doc_entry in unique_refs:
-        doc = _fetch_document(cursor, obj_type, doc_entry)
-        if doc:
-            grouped.setdefault(doc["Type"], []).append(doc)
+
+    # (obj_type del documento DESTINO, tabla de líneas)
+    line_tables = [
+        (23, "QUT1", "Oferta"),
+        (17, "RDR1", "Pedido"),
+        (15, "DLN1", "Entrega"),
+        (13, "INV1", "Factura"),
+    ]
+
+    for obj_type, line_table, type_label in line_tables:
+        try:
+            cursor.execute(
+                f"""
+                SELECT DISTINCT DocEntry
+                FROM   {line_table}
+                WHERE  BaseType = ? AND BaseEntry = ?
+                """,
+                [SERVICE_CALL_OBJTYPE, call_id],
+            )
+            entries = [int(r.DocEntry) for r in cursor.fetchall()]
+        except pyodbc.Error:
+            # Si la tabla no tiene la columna o falla, ignora
+            entries = []
+
+        for doc_entry in entries:
+            doc = _fetch_document(cursor, obj_type, doc_entry)
+            if doc:
+                grouped[type_label].append(doc)
 
     return grouped
 
@@ -473,20 +488,20 @@ def get_service_call(
                 return err(404, f"Orden de servicio #{call_id} no encontrada.")
             header = _build_header(h)
 
-            # 2. Actividades (SCL1)
-            activities = _fetch_activities(cursor, call_id)
+            # 2. Soluciones aplicadas (SCL1 — knowledge base, no actividades)
+            solutions = _fetch_solutions(cursor, call_id)
 
             # 3. Refacciones / gastos (SCL3)
             refacciones = _fetch_refacciones(cursor, call_id)
 
-            # 4. Documentos vinculados (Ofertas, Pedidos, Entregas, Facturas)
+            # 4. Documentos vinculados — buscados vía BaseType=191 en líneas
             documents = _fetch_related_documents(cursor, call_id)
 
             return {
                 "success":     True,
                 "message":     None,
                 "header":      header,
-                "activities":  activities,
+                "solutions":   solutions,
                 "refacciones": refacciones,
                 "documents":   documents,
             }
@@ -524,9 +539,10 @@ def list_customer_equipment(
                         OINS.itemName,
                         OINS.manufSN,
                         OINS.internalSN,
-                        OINS.startDate,
-                        OINS.startupDat,
-                        OINS.endDate
+                        OINS.manufDate,
+                        OINS.dlvryDate,
+                        OINS.wrrntyStrt,
+                        OINS.wrrntyEnd
                 FROM    OINS
                 WHERE   OINS.customer = ?
                 ORDER BY OINS.insID DESC
@@ -535,14 +551,15 @@ def list_customer_equipment(
             )
             rows = [
                 {
-                    "InsID":       int(r.insID),
-                    "ItemCode":    r.itemCode,
-                    "ItemName":    r.itemName,
-                    "ManufSN":     r.manufSN,
-                    "InternalSN":  r.internalSN,
-                    "StartDate":   r.startDate.isoformat()   if r.startDate   else None,
-                    "StartupDate": r.startupDat.isoformat()  if r.startupDat  else None,
-                    "EndDate":     r.endDate.isoformat()     if r.endDate     else None,
+                    "InsID":         int(r.insID),
+                    "ItemCode":      r.itemCode,
+                    "ItemName":      r.itemName,
+                    "ManufSN":       r.manufSN,
+                    "InternalSN":    r.internalSN,
+                    "ManufDate":     r.manufDate.isoformat()   if r.manufDate   else None,
+                    "DeliveryDate":  r.dlvryDate.isoformat()   if r.dlvryDate   else None,
+                    "WarrantyStart": r.wrrntyStrt.isoformat()  if r.wrrntyStrt  else None,
+                    "WarrantyEnd":   r.wrrntyEnd.isoformat()   if r.wrrntyEnd   else None,
                 }
                 for r in cursor.fetchall()
             ]
