@@ -193,12 +193,12 @@ def list_service_calls(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DETAIL_HEADER = """
-    SELECT  OSCL.CallID,
-            OSCL.Subject,
-            OSCL.customer       AS CardCode,
-            OSCL.contctPrsn,
+    SELECT  OSCL.callID         AS CallID,
+            OSCL.subject         AS Subject,
+            OSCL.customer        AS CardCode,
+            OSCL.BPContact       AS ContactName,
             OSCL.Telephone,
-            OSCL.manufactSN,
+            OSCL.manufSN         AS ManufSN,
             OSCL.internalSN,
             OSCL.insID,
             OSCL.itemCode,
@@ -215,7 +215,7 @@ _DETAIL_HEADER = """
             OSCL.createTime,
             OSCL.closeDate,
             OSCL.resolDate,
-            OSCL.responDate,
+            OSCL.respByDate      AS ResponseDate,
             OSCL.respByTime,
             OCRD.CardName        AS CustomerCardName,
             OCRD.Phone1          AS CustomerPhone,
@@ -230,12 +230,12 @@ _DETAIL_HEADER = """
     FROM    OSCL
     LEFT    JOIN OCRD ON OCRD.CardCode    = OSCL.customer
     LEFT    JOIN OSCS ON OSCS.statusID    = OSCL.status
-    LEFT    JOIN OSCO ON OSCO.OrgnCode    = OSCL.origin
+    LEFT    JOIN OSCO ON OSCO.originID    = OSCL.origin
     LEFT    JOIN OSCP ON OSCP.prblmTypID  = OSCL.problemTyp
     LEFT    JOIN OHEM ON OHEM.empID       = OSCL.assignee
     LEFT    JOIN OINS ON OINS.insID       = OSCL.insID
     LEFT    JOIN OITM ON OITM.ItemCode    = OSCL.itemCode
-    WHERE   OSCL.CallID = ?
+    WHERE   OSCL.callID = ?
 """
 
 
@@ -251,14 +251,14 @@ def _build_header(r) -> Dict[str, Any]:
             "CardName":     r.CustomerCardName,
             "Phone":        r.CustomerPhone,
             "Email":        r.CustomerEmail,
-            "ContactName":  r.contctPrsn,
+            "ContactName":  r.ContactName,
             "ContactPhone": r.Telephone,
         },
         "Equipment": {
             "InsID":        int(r.insID) if r.insID else None,
             "ItemCode":     r.itemCode,
             "ItemName":     r.ItemFullName,
-            "ManufSN":      r.EquipManufSN or r.manufactSN,
+            "ManufSN":      r.EquipManufSN or r.ManufSN,
             "InternalSN":   r.EquipInternalSN or r.internalSN,
         },
         "Status": {
@@ -275,7 +275,7 @@ def _build_header(r) -> Dict[str, Any]:
         "CreateTime":       int(r.createTime) if r.createTime is not None else None,
         "CloseDate":        r.closeDate.isoformat() if r.closeDate else None,
         "ResolutionDate":   r.resolDate.isoformat() if r.resolDate else None,
-        "ResponseDate":     r.responDate.isoformat() if r.responDate else None,
+        "ResponseDate":     r.ResponseDate.isoformat() if r.ResponseDate else None,
         "ResponseByTime":   int(r.respByTime) if r.respByTime is not None else None,
     }
 
