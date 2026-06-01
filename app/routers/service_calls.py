@@ -53,6 +53,27 @@ LINE_STATUS_MAP = {
     "C": "Cerrada",
 }
 
+# Estados de Service Call — fallback si OSCS no devuelve nombre.
+# IMPORTANTE: los códigos por defecto en SAP B1 varían entre instalaciones.
+# En Ferbel/Proshop (verificado en OSCS):
+#   -3 = Abierto, -2 = Pendiente, -1 = Cerrado
+# Esta tabla solo se usa cuando OSCS está vacío para ese statusID.
+STATUS_MAP = {
+    -3: "Abierto",
+    -2: "Pendiente",
+    -1: "Cerrado",
+}
+
+
+def _status_label(code) -> str:
+    if code is None:
+        return ""
+    try:
+        c = int(code)
+    except (ValueError, TypeError):
+        return str(code)
+    return STATUS_MAP.get(c, f"Estado {c}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1) GET /serviceCalls — lista paginada con filtros
@@ -66,19 +87,20 @@ _LIST_SELECT = """
             OSCL.itemCode,
             OSCL.itemName,
             OSCL.status,
-            AOSL.descript       AS StatusName,
+            OSCS.Name           AS StatusName,
             OSCL.priority,
             OSCL.createDate,
             OSCL.createTime,
             OSCL.closeDate,
             OHEM.firstName + ISNULL(' ' + OHEM.lastName, '') AS Tecnico
     FROM    OSCL
-    LEFT    JOIN AOSL ON AOSL.statusID = OSCL.status
+    LEFT    JOIN OSCS ON OSCS.statusID = OSCL.status
     LEFT    JOIN OHEM ON OHEM.empID    = OSCL.assignee
 """
 
 
 def _build_list_row(r) -> Dict[str, Any]:
+    status_code = int(r.status) if r.status is not None else None
     return {
         "CallID":        int(r.CallID),
         "Subject":       r.Subject,
@@ -86,8 +108,9 @@ def _build_list_row(r) -> Dict[str, Any]:
         "CustomerName":  r.customerName,
         "ItemCode":      r.itemCode,
         "ItemName":      r.itemName,
-        "Status":        int(r.status) if r.status is not None else None,
-        "StatusName":    r.StatusName,
+        "Status":        status_code,
+        # Si OSCS no devuelve un nombre (estado custom sin descripción), cae al map estándar
+        "StatusName":    r.StatusName or _status_label(status_code),
         "Priority":      r.priority,
         "PriorityLabel": PRIORITY_MAP.get(r.priority, r.priority or ""),
         "CreateDate":    r.createDate.isoformat() if r.createDate else None,
@@ -197,26 +220,27 @@ _DETAIL_HEADER = """
             OCRD.CardName        AS CustomerCardName,
             OCRD.Phone1          AS CustomerPhone,
             OCRD.E_Mail          AS CustomerEmail,
-            AOSL.descript        AS StatusName,
-            OACL.Name            AS OrigenName,
-            OPRL.Name            AS ProblemName,
+            OSCS.Name            AS StatusName,
+            OSCO.Name            AS OrigenName,
+            OSCP.Name            AS ProblemName,
             OHEM.firstName + ISNULL(' ' + OHEM.lastName, '') AS TecnicoName,
             OINS.manufSN         AS EquipManufSN,
             OINS.internalSN      AS EquipInternalSN,
             OITM.ItemName        AS ItemFullName
     FROM    OSCL
-    LEFT    JOIN OCRD ON OCRD.CardCode  = OSCL.customer
-    LEFT    JOIN AOSL ON AOSL.statusID  = OSCL.status
-    LEFT    JOIN OACL ON OACL.Code      = OSCL.origin
-    LEFT    JOIN OPRL ON OPRL.Code      = OSCL.problemTyp
-    LEFT    JOIN OHEM ON OHEM.empID     = OSCL.assignee
-    LEFT    JOIN OINS ON OINS.insID     = OSCL.insID
-    LEFT    JOIN OITM ON OITM.ItemCode  = OSCL.itemCode
+    LEFT    JOIN OCRD ON OCRD.CardCode    = OSCL.customer
+    LEFT    JOIN OSCS ON OSCS.statusID    = OSCL.status
+    LEFT    JOIN OSCO ON OSCO.OrgnCode    = OSCL.origin
+    LEFT    JOIN OSCP ON OSCP.prblmTypID  = OSCL.problemTyp
+    LEFT    JOIN OHEM ON OHEM.empID       = OSCL.assignee
+    LEFT    JOIN OINS ON OINS.insID       = OSCL.insID
+    LEFT    JOIN OITM ON OITM.ItemCode    = OSCL.itemCode
     WHERE   OSCL.CallID = ?
 """
 
 
 def _build_header(r) -> Dict[str, Any]:
+    status_code = int(r.status) if r.status is not None else None
     return {
         "CallID":           int(r.CallID),
         "Subject":          r.Subject,
@@ -238,8 +262,8 @@ def _build_header(r) -> Dict[str, Any]:
             "InternalSN":   r.EquipInternalSN or r.internalSN,
         },
         "Status": {
-            "Code":         int(r.status) if r.status is not None else None,
-            "Label":        r.StatusName,
+            "Code":         status_code,
+            "Label":        r.StatusName or _status_label(status_code),
         },
         "Priority":         r.priority,
         "PriorityLabel":    PRIORITY_MAP.get(r.priority, r.priority or ""),
