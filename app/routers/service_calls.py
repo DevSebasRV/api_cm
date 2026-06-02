@@ -375,6 +375,7 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
     cursor.execute(
         f"""
         SELECT  LineNum, ItemCode, Dscription, Quantity, Price, LineTotal,
+                VatSum, VatPrcnt, PriceAfVAT,
                 LineStatus, WhsCode, TargetType, TrgetEntry
         FROM    {l_table}
         WHERE   DocEntry = ?
@@ -390,9 +391,14 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
             "Quantity":    float(l.Quantity)  if l.Quantity  is not None else 0.0,
             "Price":       float(l.Price)     if l.Price     is not None else 0.0,
             "LineTotal":   float(l.LineTotal) if l.LineTotal is not None else 0.0,
+            "VatSum":      float(l.VatSum)    if l.VatSum    is not None else 0.0,
+            "VatPrcnt":    float(l.VatPrcnt)  if l.VatPrcnt  is not None else 0.0,
+            "PriceAfVAT":  float(l.PriceAfVAT) if l.PriceAfVAT is not None else 0.0,
             "LineStatus":      l.LineStatus,
             "LineStatusLabel": LINE_STATUS_MAP.get(l.LineStatus, l.LineStatus or ""),
             "WhsCode":     l.WhsCode,
+            "StockHere":   0.0,   # Se llena después con _enrich_lines_with_stock
+            "StockOther":  0.0,   # Se llena después
             "TargetType":  int(l.TargetType) if l.TargetType is not None else None,
             "TargetLabel": OBJ_TYPE_MAP.get(int(l.TargetType), None) if l.TargetType else None,
             "TargetEntry": int(l.TrgetEntry) if l.TrgetEntry is not None else None,
@@ -511,6 +517,145 @@ def _fetch_related_documents(
     return grouped
 
 
+def _enrich_lines_with_stock(cursor, documents: Dict[str, List[Dict[str, Any]]]) -> None:
+    """
+    Llena StockHere y StockOther en cada línea de cada documento.
+    Hace UNA sola query a OITW agrupando todos los ItemCodes únicos.
+
+    - StockHere  = OnHand en el WhsCode de la propia línea
+    - StockOther = sum(OnHand) de todos los OTROS almacenes para ese item
+    """
+    item_codes = set()
+    for docs in documents.values():
+        for doc in docs:
+            for line in doc.get("Lines", []):
+                if line.get("ItemCode"):
+                    item_codes.add(line["ItemCode"])
+
+    if not item_codes:
+        return
+
+    placeholders = ",".join("?" * len(item_codes))
+    cursor.execute(
+        f"SELECT ItemCode, WhsCode, OnHand FROM OITW WHERE ItemCode IN ({placeholders})",
+        list(item_codes),
+    )
+
+    stock_map: Dict[str, Dict[str, float]] = {}
+    for r in cursor.fetchall():
+        stock_map.setdefault(r.ItemCode, {})[r.WhsCode] = float(r.OnHand or 0)
+
+    for docs in documents.values():
+        for doc in docs:
+            for line in doc.get("Lines", []):
+                item = line.get("ItemCode")
+                whs  = line.get("WhsCode")
+                per_whs = stock_map.get(item, {})
+                line["StockHere"]  = per_whs.get(whs, 0.0) if whs else 0.0
+                line["StockOther"] = sum(v for k, v in per_whs.items() if k != whs)
+
+
+@router.get(
+    "/itemStock/{item_code}",
+    summary="Stock detallado de un artículo, agrupado por sucursal y almacén",
+)
+def get_item_stock(
+    item_code: str,
+    x_sap_db:  Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Devuelve el stock completo de un artículo:
+    - Total general
+    - Agrupado por sucursal (OLCT.Location)
+    - Cada sucursal con sus almacenes (OWHS) y cantidades
+
+    Usado por el modal "Ver más" en las líneas de documentos del detalle
+    de Órdenes de Servicio.
+    """
+    _, database = resolve_db(x_sap_db)
+
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            # Verificar que el item exista
+            cursor.execute("SELECT ItemName FROM OITM WHERE ItemCode = ?", [item_code])
+            row = cursor.fetchone()
+            if not row:
+                return err(404, f"Artículo '{item_code}' no existe en OITM.")
+            item_name = row.ItemName
+
+            cursor.execute(
+                """
+                SELECT  OWHS.WhsCode,
+                        OWHS.WhsName,
+                        OITW.OnHand,
+                        OITW.IsCommited   AS Committed,
+                        OITW.OnOrder,
+                        COALESCE(OLCT.Location, 'SIN LOCALIDAD') AS LocationName
+                FROM    OITW
+                JOIN    OWHS ON OWHS.WhsCode = OITW.WhsCode
+                LEFT    JOIN OLCT ON OLCT.Code = OWHS.Location
+                WHERE   OITW.ItemCode = ?
+                ORDER BY LocationName, OWHS.WhsName
+                """,
+                [item_code],
+            )
+
+            by_location: Dict[str, Dict[str, Any]] = {}
+            total_onhand   = 0.0
+            total_commit   = 0.0
+            total_avail    = 0.0
+
+            for r in cursor.fetchall():
+                loc_raw = (r.LocationName or "SIN LOCALIDAD").strip()
+                loc_key = loc_raw.upper().replace(" ", "")
+                if loc_key not in by_location:
+                    by_location[loc_key] = {
+                        "Location":     loc_raw,
+                        "TotalOnHand":  0.0,
+                        "TotalAvailable": 0.0,
+                        "Warehouses":   [],
+                    }
+                on_hand   = float(r.OnHand    or 0)
+                committed = float(r.Committed or 0)
+                on_order  = float(r.OnOrder   or 0)
+                available = on_hand - committed
+
+                by_location[loc_key]["Warehouses"].append({
+                    "WhsCode":   r.WhsCode,
+                    "WhsName":   r.WhsName,
+                    "OnHand":    on_hand,
+                    "Committed": committed,
+                    "OnOrder":   on_order,
+                    "Available": available,
+                })
+                by_location[loc_key]["TotalOnHand"]    += on_hand
+                by_location[loc_key]["TotalAvailable"] += available
+
+                total_onhand += on_hand
+                total_commit += committed
+                total_avail  += available
+
+            return {
+                "success":        True,
+                "message":        None,
+                "ItemCode":       item_code,
+                "ItemName":       item_name,
+                "TotalOnHand":    total_onhand,
+                "TotalCommitted": total_commit,
+                "TotalAvailable": total_avail,
+                "ByLocation":     list(by_location.values()),
+            }
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
 @router.get(
     "/serviceCalls/{call_id}",
     summary="Detalle de una orden de servicio + documentos vinculados",
@@ -547,6 +692,9 @@ def get_service_call(
                 h.createDate,
                 h.closeDate,
             )
+
+            # 5. Enriquecer cada línea con stock del propio almacén y otros
+            _enrich_lines_with_stock(cursor, documents)
 
             return {
                 "success":     True,
