@@ -556,13 +556,15 @@ def _enrich_lines_with_stock(cursor, documents: Dict[str, List[Dict[str, Any]]])
 
 
 @router.get(
-    "/itemStock/{item_code}",
+    "/itemStock",
     summary="Stock detallado de un artículo, agrupado por sucursal y almacén",
 )
 def get_item_stock(
-    item_code: str,
-    x_sap_db:  Optional[str] = Header(default=None, alias="X-SAP-DB"),
+    code:     str           = Query(..., description="ItemCode del artículo (puede contener /, espacios, etc.)"),
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
 ):
+    """Recibe el ItemCode como query param para soportar slashes y caracteres especiales."""
+    item_code = code
     """
     Devuelve el stock completo de un artículo:
     - Total general
