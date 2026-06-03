@@ -723,6 +723,92 @@ def get_service_call(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get(
+    "/serviceCalls/catalogs",
+    summary="Catálogos necesarios para crear una orden de servicio (origenes, tipos, técnicos, status, series)",
+)
+def get_catalogs(
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Devuelve los catálogos que el form de creación necesita:
+    - OSCO Origenes
+    - OSCP Tipos de problema
+    - OSCS Status (estados)
+    - OHEM Empleados activos (asesores y técnicos)
+    - NNM1 Series (numeración para Service Calls, ObjectCode='191')
+    - Prioridades hardcoded (L/M/H)
+    """
+    _, database = resolve_db(x_sap_db)
+
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            # Origenes
+            cursor.execute("SELECT originID, Name FROM OSCO WHERE ISNULL(Active,'Y')='Y' ORDER BY Name")
+            origins = [{"id": int(r.originID), "name": r.Name} for r in cursor.fetchall()]
+
+            # Problem types
+            cursor.execute("SELECT prblmTypID, Name FROM OSCP WHERE ISNULL(Active,'Y')='Y' ORDER BY Name")
+            problems = [{"id": int(r.prblmTypID), "name": r.Name} for r in cursor.fetchall()]
+
+            # Status — solo activos
+            cursor.execute("SELECT statusID, Name FROM OSCS WHERE ISNULL(Active,'Y')='Y' ORDER BY statusID")
+            statuses = [{"id": int(r.statusID), "name": r.Name} for r in cursor.fetchall()]
+
+            # Empleados activos (try Active='Y'; si falla, traer todos)
+            try:
+                cursor.execute(
+                    "SELECT empID, firstName, lastName "
+                    "FROM   OHEM "
+                    "WHERE  ISNULL(Active,'Y')='Y' "
+                    "ORDER BY firstName, lastName"
+                )
+            except pyodbc.Error:
+                cursor.execute("SELECT empID, firstName, lastName FROM OHEM ORDER BY firstName, lastName")
+            employees = [
+                {
+                    "id":   int(r.empID),
+                    "name": (f"{r.firstName or ''} {r.lastName or ''}").strip() or f"#{r.empID}",
+                }
+                for r in cursor.fetchall()
+            ]
+
+            # Series para ServiceCalls (ObjectCode=191)
+            try:
+                cursor.execute(
+                    "SELECT Series, SeriesName "
+                    "FROM   NNM1 "
+                    "WHERE  ObjectCode = '191' AND ISNULL(Locked,'N') = 'N' "
+                    "ORDER BY SeriesName"
+                )
+                series = [{"id": int(r.Series), "name": r.SeriesName} for r in cursor.fetchall()]
+            except pyodbc.Error:
+                series = []
+
+            return {
+                "success":   True,
+                "origins":   origins,
+                "problems":  problems,
+                "statuses":  statuses,
+                "employees": employees,
+                "series":    series,
+                "priorities": [
+                    {"id": "L", "name": "Baja"},
+                    {"id": "M", "name": "Media"},
+                    {"id": "H", "name": "Alta"},
+                ],
+            }
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
+@router.get(
     "/equipment/customer/{card_code}",
     summary="Lista las Tarjetas de Equipo (motos) de un cliente",
 )
