@@ -375,7 +375,7 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
     cursor.execute(
         f"""
         SELECT  LineNum, ItemCode, Dscription, Quantity, Price, LineTotal,
-                VatSum, VatPrcnt, PriceAfVAT,
+                VatSum, VatPrcnt, PriceAfVAT, GTotal,
                 LineStatus, WhsCode, TargetType, TrgetEntry
         FROM    {l_table}
         WHERE   DocEntry = ?
@@ -390,10 +390,13 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
             "Description": l.Dscription,
             "Quantity":    float(l.Quantity)  if l.Quantity  is not None else 0.0,
             "Price":       float(l.Price)     if l.Price     is not None else 0.0,
+            # LineTotal = Subtotal SIN IVA  (Qty × Price)
             "LineTotal":   float(l.LineTotal) if l.LineTotal is not None else 0.0,
             "VatSum":      float(l.VatSum)    if l.VatSum    is not None else 0.0,
             "VatPrcnt":    float(l.VatPrcnt)  if l.VatPrcnt  is not None else 0.0,
             "PriceAfVAT":  float(l.PriceAfVAT) if l.PriceAfVAT is not None else 0.0,
+            # GTotal = Total CON IVA (LineTotal + VatSum). Es lo que SAP llama "Importe" en la UI.
+            "GTotal":      float(l.GTotal)    if l.GTotal    is not None else 0.0,
             "LineStatus":      l.LineStatus,
             "LineStatusLabel": LINE_STATUS_MAP.get(l.LineStatus, l.LineStatus or ""),
             "WhsCode":     l.WhsCode,
