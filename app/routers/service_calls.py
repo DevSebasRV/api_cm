@@ -723,7 +723,7 @@ def get_service_call(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get(
-    "/serviceCalls/catalogs",
+    "/serviceCallCatalogs",
     summary="Catálogos necesarios para crear una orden de servicio (origenes, tipos, técnicos, status, series)",
 )
 def get_catalogs(
