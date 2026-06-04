@@ -51,13 +51,12 @@ def _keyword_conditions(keyword: str):
 def _get_total(cursor, keyword: Optional[str] = None) -> int:
     if keyword:
         kw_clause, kw_params = _keyword_conditions(keyword)
-        # WHERE 1=1 simplifica concatenar el AND del keyword
         cursor.execute(
-            f"SELECT COUNT(*) FROM OCRD WHERE 1=1 {kw_clause}",
+            f"SELECT COUNT(*) FROM OCRD WHERE CardType = 'C' {kw_clause}",
             kw_params,
         )
     else:
-        cursor.execute("SELECT COUNT(*) FROM OCRD")
+        cursor.execute("SELECT COUNT(*) FROM OCRD WHERE CardType = 'C'")
     return cursor.fetchone()[0]
 
 
@@ -68,14 +67,15 @@ def fetch_bps(cursor, page: int, page_size: int, keyword: Optional[str] = None):
     if keyword:
         kw_clause, kw_params = _keyword_conditions(keyword)
         cursor.execute(
-            _SELECT + f" WHERE 1=1 {kw_clause}"
+            _SELECT + f" WHERE CardType = 'C' {kw_clause}"
                       " ORDER BY CreateDate DESC, CardCode DESC"
                       " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             kw_params + [offset, page_size],
         )
     else:
         cursor.execute(
-            _SELECT + " ORDER BY CardCode"
+            _SELECT + " WHERE CardType = 'C'"
+                      " ORDER BY CardCode"
                       " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             [offset, page_size],
         )
@@ -123,7 +123,7 @@ def get_business_partners(
         try:
             # 1) Búsqueda por código exacto
             if cardCode:
-                cursor.execute(_SELECT + " WHERE CardCode = ?", [cardCode])
+                cursor.execute(_SELECT + " WHERE CardCode = ? AND CardType = 'C'", [cardCode])
                 row = cursor.fetchone()
                 if not row:
                     return err(404, f"Socio '{cardCode}' no encontrado en {db_key}.")
