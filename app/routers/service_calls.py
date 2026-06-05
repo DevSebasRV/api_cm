@@ -750,32 +750,33 @@ def serial_lookup(
             cursor.execute(
                 """
                 SELECT TOP 20
-                       OSRN.SysSerial,
+                       OSRI.SysSerial,
                        OSRN.DistNumber,
                        OSRN.MnfSerial,
-                       OSRN.IntrSerial,
-                       OSRN.SuppSerial,
-                       OSRN.Lot,
-                       OSRN.ItemCode,
+                       OSRI.IntrSerial,
+                       OSRI.SuppSerial,
+                       OSRN.LotNumber      AS Lot,
+                       OSRI.ItemCode,
                        OITM.ItemName,
                        OITM.ItmsGrpCod,
                        OITB.ItmsGrpNam,
-                       OSRN.CardCode,
+                       OSRI.CardCode,
                        OCRD.CardName       AS CustomerName,
-                       OSRN.WhsCode,
+                       OSRI.WhsCode,
                        OWHS.WhsName        AS WhsName,
-                       OSRN.Status,
-                       OSRN.Notes
-                FROM   OSRN
-                LEFT   JOIN OITM ON OITM.ItemCode   = OSRN.ItemCode
+                       OSRI.Status,
+                       OSRI.Notes
+                FROM   OSRI
+                LEFT   JOIN OSRN ON OSRN.ItemCode   = OSRI.ItemCode AND OSRN.SysNumber = OSRI.SysSerial
+                LEFT   JOIN OITM ON OITM.ItemCode   = OSRI.ItemCode
                 LEFT   JOIN OITB ON OITB.ItmsGrpCod = OITM.ItmsGrpCod
-                LEFT   JOIN OCRD ON OCRD.CardCode   = OSRN.CardCode
-                LEFT   JOIN OWHS ON OWHS.WhsCode    = OSRN.WhsCode
+                LEFT   JOIN OCRD ON OCRD.CardCode   = OSRI.CardCode
+                LEFT   JOIN OWHS ON OWHS.WhsCode    = OSRI.WhsCode
                 WHERE  OSRN.DistNumber LIKE ?
                    OR  OSRN.MnfSerial  LIKE ?
-                   OR  OSRN.IntrSerial LIKE ?
-                   OR  OSRN.SuppSerial LIKE ?
-                ORDER BY OSRN.SysSerial DESC
+                   OR  OSRI.IntrSerial LIKE ?
+                   OR  OSRI.SuppSerial LIKE ?
+                ORDER BY OSRI.SysSerial DESC
                 """,
                 [like, like, like, like],
             )
