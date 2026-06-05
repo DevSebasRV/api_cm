@@ -723,6 +723,101 @@ def get_service_call(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get(
+    "/serialLookup",
+    summary="Busca un equipo por número de serie (manufactura, interno, distribución o proveedor)",
+)
+def serial_lookup(
+    serial:   str           = Query(..., min_length=1, description="Texto a buscar en los números de serie"),
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Busca en OSRN cruzando con OITM (artículo) y OCRD (cliente actual).
+    Devuelve hasta 20 coincidencias para que el usuario elija.
+
+    Campos buscados (con LIKE %x%):
+      - OSRN.DistNumber  (Número de distribución / serie principal)
+      - OSRN.MnfSerial   (Serie de fabricante)
+      - OSRN.IntrSerial  (Serie interna)
+      - OSRN.SuppSerial  (Serie del proveedor)
+    """
+    _, database = resolve_db(x_sap_db)
+
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            like = f"%{serial}%"
+            cursor.execute(
+                """
+                SELECT TOP 20
+                       OSRN.SysSerial,
+                       OSRN.DistNumber,
+                       OSRN.MnfSerial,
+                       OSRN.IntrSerial,
+                       OSRN.SuppSerial,
+                       OSRN.Lot,
+                       OSRN.ItemCode,
+                       OITM.ItemName,
+                       OITM.ItmsGrpCod,
+                       OITB.ItmsGrpNam,
+                       OSRN.CardCode,
+                       OCRD.CardName       AS CustomerName,
+                       OSRN.WhsCode,
+                       OWHS.WhsName        AS WhsName,
+                       OSRN.Status,
+                       OSRN.Notes
+                FROM   OSRN
+                LEFT   JOIN OITM ON OITM.ItemCode   = OSRN.ItemCode
+                LEFT   JOIN OITB ON OITB.ItmsGrpCod = OITM.ItmsGrpCod
+                LEFT   JOIN OCRD ON OCRD.CardCode   = OSRN.CardCode
+                LEFT   JOIN OWHS ON OWHS.WhsCode    = OSRN.WhsCode
+                WHERE  OSRN.DistNumber LIKE ?
+                   OR  OSRN.MnfSerial  LIKE ?
+                   OR  OSRN.IntrSerial LIKE ?
+                   OR  OSRN.SuppSerial LIKE ?
+                ORDER BY OSRN.SysSerial DESC
+                """,
+                [like, like, like, like],
+            )
+
+            results = [
+                {
+                    "SysSerial":    int(r.SysSerial) if r.SysSerial is not None else None,
+                    "DistNumber":   r.DistNumber,
+                    "ManufSN":      r.MnfSerial,
+                    "InternalSN":   r.IntrSerial,
+                    "SupplierSN":   r.SuppSerial,
+                    "Lot":          r.Lot,
+                    "ItemCode":     r.ItemCode,
+                    "ItemName":     r.ItemName,
+                    "ItemGroup":    r.ItmsGrpNam,
+                    "CardCode":     r.CardCode,
+                    "CustomerName": r.CustomerName,
+                    "WhsCode":      r.WhsCode,
+                    "WhsName":      r.WhsName,
+                    "Status":       r.Status,
+                    "Notes":        r.Notes,
+                }
+                for r in cursor.fetchall()
+            ]
+
+            return {
+                "success": True,
+                "message": None,
+                "query":   serial,
+                "count":   len(results),
+                "results": results,
+            }
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
+@router.get(
     "/serviceCallCatalogs",
     summary="Catálogos necesarios para crear una orden de servicio (origenes, tipos, técnicos, status, series)",
 )
