@@ -749,36 +749,62 @@ def serial_lookup(
             like = f"%{serial}%"
             cursor.execute(
                 """
-                SELECT TOP 20
-                       OSRI.SysSerial,
-                       OSRN.DistNumber,
-                       OSRN.MnfSerial,
-                       OSRI.IntrSerial,
-                       OSRI.SuppSerial,
-                       OSRN.LotNumber      AS Lot,
-                       OSRI.ItemCode,
-                       OITM.ItemName,
-                       OITM.ItmsGrpCod,
-                       OITB.ItmsGrpNam,
-                       OSRI.CardCode,
-                       OCRD.CardName       AS CustomerName,
-                       OSRI.WhsCode,
-                       OWHS.WhsName        AS WhsName,
-                       OSRI.Status,
-                       OSRI.Notes
-                FROM   OSRI
-                LEFT   JOIN OSRN ON OSRN.ItemCode   = OSRI.ItemCode AND OSRN.SysNumber = OSRI.SysSerial
-                LEFT   JOIN OITM ON OITM.ItemCode   = OSRI.ItemCode
-                LEFT   JOIN OITB ON OITB.ItmsGrpCod = OITM.ItmsGrpCod
-                LEFT   JOIN OCRD ON OCRD.CardCode   = OSRI.CardCode
-                LEFT   JOIN OWHS ON OWHS.WhsCode    = OSRI.WhsCode
-                WHERE  OSRN.DistNumber LIKE ?
-                   OR  OSRN.MnfSerial  LIKE ?
-                   OR  OSRI.IntrSerial LIKE ?
-                   OR  OSRI.SuppSerial LIKE ?
-                ORDER BY OSRI.SysSerial DESC
+                SELECT TOP 20 * FROM (
+                    -- 1. Buscar en Tarjetas de Equipo (OINS)
+                    SELECT
+                        OINS.insID          AS SysSerial,
+                        OINS.internalSN     AS DistNumber,
+                        OINS.manufSN        AS MnfSerial,
+                        OINS.internalSN     AS IntrSerial,
+                        ''                  AS SuppSerial,
+                        ''                  AS Lot,
+                        OINS.itemCode       AS ItemCode,
+                        OINS.itemName       AS ItemName,
+                        OITB.ItmsGrpNam     AS ItmsGrpNam,
+                        OINS.customer       AS CardCode,
+                        OINS.custmrName     AS CustomerName,
+                        ''                  AS WhsCode,
+                        ''                  AS WhsName,
+                        OINS.status         AS Status,
+                        'Tarjeta de Equipo' AS Notes
+                    FROM OINS
+                    LEFT JOIN OITB ON OITB.ItmsGrpCod = OINS.itemGroup
+                    WHERE OINS.internalSN LIKE ?
+                       OR OINS.manufSN LIKE ?
+                    
+                    UNION ALL
+                    
+                    -- 2. Buscar en Números de Serie (OSRI + OSRN)
+                    SELECT
+                        OSRI.SysSerial      AS SysSerial,
+                        OSRN.DistNumber     AS DistNumber,
+                        OSRN.MnfSerial      AS MnfSerial,
+                        OSRI.IntrSerial     AS IntrSerial,
+                        OSRI.SuppSerial     AS SuppSerial,
+                        OSRN.LotNumber      AS Lot,
+                        OSRI.ItemCode       AS ItemCode,
+                        OITM.ItemName       AS ItemName,
+                        OITB.ItmsGrpNam     AS ItmsGrpNam,
+                        OSRI.CardCode       AS CardCode,
+                        OCRD.CardName       AS CustomerName,
+                        OSRI.WhsCode        AS WhsCode,
+                        OWHS.WhsName        AS WhsName,
+                        CAST(OSRI.Status AS VARCHAR(10)) AS Status,
+                        'Inventario'        AS Notes
+                    FROM OSRI
+                    LEFT JOIN OSRN ON OSRN.ItemCode = OSRI.ItemCode AND OSRN.SysNumber = OSRI.SysSerial
+                    LEFT JOIN OITM ON OITM.ItemCode = OSRI.ItemCode
+                    LEFT JOIN OITB ON OITB.ItmsGrpCod = OITM.ItmsGrpCod
+                    LEFT JOIN OCRD ON OCRD.CardCode = OSRI.CardCode
+                    LEFT JOIN OWHS ON OWHS.WhsCode = OSRI.WhsCode
+                    WHERE OSRN.DistNumber LIKE ?
+                       OR OSRN.MnfSerial LIKE ?
+                       OR OSRI.IntrSerial LIKE ?
+                       OR OSRI.SuppSerial LIKE ?
+                ) AS Combined
+                ORDER BY Combined.Notes ASC, Combined.SysSerial DESC
                 """,
-                [like, like, like, like],
+                [like, like, like, like, like, like],
             )
 
             results = [
