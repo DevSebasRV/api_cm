@@ -747,60 +747,64 @@ def serial_lookup(
         cursor = conn.cursor()
         try:
             like = f"%{serial}%"
+            # Estrategia segura: solo dos tablas que sabemos que existen.
+            #   1. OINS — Tarjetas de Equipo (series ya entregadas a clientes)
+            #   2. OSRN — Maestro de números de serie (incluye los en inventario)
+            # OSRN no tiene columna de cliente, así que ahí dejamos NULL.
             cursor.execute(
                 """
                 SELECT TOP 20 * FROM (
-                    -- 1. Buscar en Tarjetas de Equipo (OINS)
+                    -- 1. Tarjetas de Equipo (OINS) — equipos en posesión del cliente
                     SELECT
                         OINS.insID          AS SysSerial,
                         OINS.internalSN     AS DistNumber,
                         OINS.manufSN        AS MnfSerial,
                         OINS.internalSN     AS IntrSerial,
-                        ''                  AS SuppSerial,
-                        ''                  AS Lot,
+                        CAST(NULL AS NVARCHAR(50)) AS SuppSerial,
+                        CAST(NULL AS NVARCHAR(50)) AS Lot,
                         OINS.itemCode       AS ItemCode,
                         OINS.itemName       AS ItemName,
                         OITB.ItmsGrpNam     AS ItmsGrpNam,
                         OINS.customer       AS CardCode,
                         OINS.custmrName     AS CustomerName,
-                        ''                  AS WhsCode,
-                        ''                  AS WhsName,
-                        OINS.status         AS Status,
+                        OINS.cntctPhone     AS CustomerPhone,
+                        CAST(NULL AS NVARCHAR(10)) AS WhsCode,
+                        CAST(NULL AS NVARCHAR(100)) AS WhsName,
+                        CAST(OINS.status AS NVARCHAR(20)) AS Status,
                         'Tarjeta de Equipo' AS Notes
                     FROM OINS
                     LEFT JOIN OITB ON OITB.ItmsGrpCod = OINS.itemGroup
                     WHERE OINS.internalSN LIKE ?
-                       OR OINS.manufSN LIKE ?
-                    
+                       OR OINS.manufSN    LIKE ?
+
                     UNION ALL
-                    
-                    -- 2. Buscar en Números de Serie (OSRI + OSRN)
+
+                    -- 2. Maestro de Series (OSRN) — equipos en inventario sin cliente
                     SELECT
-                        OSRI.SysSerial      AS SysSerial,
+                        OSRN.SysSerial      AS SysSerial,
                         OSRN.DistNumber     AS DistNumber,
                         OSRN.MnfSerial      AS MnfSerial,
-                        OSRI.IntrSerial     AS IntrSerial,
-                        OSRI.SuppSerial     AS SuppSerial,
-                        OSRN.LotNumber      AS Lot,
-                        OSRI.ItemCode       AS ItemCode,
+                        OSRN.IntrSerial     AS IntrSerial,
+                        OSRN.SuppSerial     AS SuppSerial,
+                        OSRN.Lot            AS Lot,
+                        OSRN.ItemCode       AS ItemCode,
                         OITM.ItemName       AS ItemName,
                         OITB.ItmsGrpNam     AS ItmsGrpNam,
-                        OSRI.CardCode       AS CardCode,
-                        OCRD.CardName       AS CustomerName,
-                        OSRI.WhsCode        AS WhsCode,
+                        CAST(NULL AS NVARCHAR(15)) AS CardCode,
+                        CAST(NULL AS NVARCHAR(100)) AS CustomerName,
+                        CAST(NULL AS NVARCHAR(20)) AS CustomerPhone,
+                        OSRN.WhsCode        AS WhsCode,
                         OWHS.WhsName        AS WhsName,
-                        CAST(OSRI.Status AS VARCHAR(10)) AS Status,
+                        CAST(OSRN.Status AS NVARCHAR(20)) AS Status,
                         'Inventario'        AS Notes
-                    FROM OSRI
-                    LEFT JOIN OSRN ON OSRN.ItemCode = OSRI.ItemCode AND OSRN.SysNumber = OSRI.SysSerial
-                    LEFT JOIN OITM ON OITM.ItemCode = OSRI.ItemCode
+                    FROM OSRN
+                    LEFT JOIN OITM ON OITM.ItemCode   = OSRN.ItemCode
                     LEFT JOIN OITB ON OITB.ItmsGrpCod = OITM.ItmsGrpCod
-                    LEFT JOIN OCRD ON OCRD.CardCode = OSRI.CardCode
-                    LEFT JOIN OWHS ON OWHS.WhsCode = OSRI.WhsCode
+                    LEFT JOIN OWHS ON OWHS.WhsCode    = OSRN.WhsCode
                     WHERE OSRN.DistNumber LIKE ?
-                       OR OSRN.MnfSerial LIKE ?
-                       OR OSRI.IntrSerial LIKE ?
-                       OR OSRI.SuppSerial LIKE ?
+                       OR OSRN.MnfSerial  LIKE ?
+                       OR OSRN.IntrSerial LIKE ?
+                       OR OSRN.SuppSerial LIKE ?
                 ) AS Combined
                 ORDER BY Combined.Notes ASC, Combined.SysSerial DESC
                 """,
@@ -820,6 +824,7 @@ def serial_lookup(
                     "ItemGroup":    r.ItmsGrpNam,
                     "CardCode":     r.CardCode,
                     "CustomerName": r.CustomerName,
+                    "CustomerPhone": r.CustomerPhone,
                     "WhsCode":      r.WhsCode,
                     "WhsName":      r.WhsName,
                     "Status":       r.Status,

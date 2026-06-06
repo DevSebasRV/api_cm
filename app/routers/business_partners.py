@@ -92,6 +92,69 @@ def err(status: int, message: str):
 
 
 @router.get(
+    "/businessPartners/nextCode",
+    summary="Devuelve el próximo CardCode disponible para Clientes (formato C##### sequencial)",
+)
+def next_card_code(
+    prefix:   str           = Query(default="C", min_length=1, max_length=3, description="Prefijo del código (default 'C' para Cliente)"),
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Busca el último CardCode que empieza con el prefijo dado y devuelve
+    el siguiente número incrementado en 1, con padding a 5 dígitos.
+
+    Ejemplo: si el último es C00099 → devuelve C00100.
+    Si no hay ninguno → devuelve C00001.
+    """
+    db_key = (x_sap_db or "fn").lower()
+    if db_key not in EMPRESAS:
+        return err(400, f"X-SAP-DB '{x_sap_db}' no válida. Usa: {list(EMPRESAS.keys())}.")
+
+    try:
+        conn   = get_connection(EMPRESAS[db_key])
+        cursor = conn.cursor()
+        try:
+            prefix_len = len(prefix)
+            # Buscamos códigos que empiezan con el prefijo y donde el resto es numérico.
+            # Tomamos el de mayor valor numérico, no el de mayor longitud de string.
+            cursor.execute(
+                f"""
+                SELECT TOP 1 CardCode
+                FROM   OCRD
+                WHERE  CardCode LIKE '{prefix}%'
+                  AND  CardType = 'C'
+                  AND  LEN(CardCode) > {prefix_len}
+                  AND  SUBSTRING(CardCode, {prefix_len + 1}, LEN(CardCode)) NOT LIKE '%[^0-9]%'
+                ORDER BY CAST(SUBSTRING(CardCode, {prefix_len + 1}, LEN(CardCode)) AS BIGINT) DESC
+                """
+            )
+            row = cursor.fetchone()
+            if row and row.CardCode:
+                num_part = int(row.CardCode[prefix_len:])
+                next_num = num_part + 1
+            else:
+                next_num = 1
+
+            next_code = f"{prefix}{next_num:05d}"  # padding a 5 dígitos
+
+            return {
+                "success":  True,
+                "message":  None,
+                "prefix":   prefix,
+                "lastCode": row.CardCode if row else None,
+                "nextCode": next_code,
+            }
+        finally:
+            cursor.close()
+            conn.close()
+
+    except pyodbc.Error as db_err:
+        return err(500, f"Error al consultar SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
+@router.get(
     "/businessPartners",
     summary="Socios de negocio SAP B1 (lectura rápida vía ODBC)",
 )
