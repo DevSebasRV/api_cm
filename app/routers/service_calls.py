@@ -779,27 +779,27 @@ def serial_lookup(
 
                     UNION ALL
 
-                    -- 2. Maestro de Series (OSRN) — equipos en inventario sin cliente
+                    -- 2. Maestro de Series (OSRN) — equipos en inventario
                     --
-                    -- NOTA: OSRN.WhsCode NO existe en esta versión de SAP B1.
-                    -- En B1 ≥ 9.3 PL10 sí, pero acá hay que dejarlo NULL.
-                    -- Si más adelante se necesita el almacén, hay que hacer
-                    -- JOIN a OSRI / SRI1 (movimientos de series con WhsCode).
+                    -- Columnas verificadas vía INFORMATION_SCHEMA en ESTA DB:
+                    --   SysNumber (no SysSerial), LotNumber (no Lot),
+                    --   itemName en minúscula, Location en vez de WhsCode.
+                    --   NO existen: IntrSerial, SuppSerial, WhsCode, CardCode.
                     SELECT
-                        OSRN.SysSerial      AS SysSerial,
+                        OSRN.SysNumber      AS SysSerial,
                         OSRN.DistNumber     AS DistNumber,
                         OSRN.MnfSerial      AS MnfSerial,
-                        OSRN.IntrSerial     AS IntrSerial,
-                        OSRN.SuppSerial     AS SuppSerial,
-                        OSRN.Lot            AS Lot,
+                        CAST(NULL AS NVARCHAR(50))  AS IntrSerial,
+                        CAST(NULL AS NVARCHAR(50))  AS SuppSerial,
+                        OSRN.LotNumber      AS Lot,
                         OSRN.ItemCode       AS ItemCode,
-                        OITM.ItemName       AS ItemName,
+                        ISNULL(OITM.ItemName, OSRN.itemName) AS ItemName,
                         OITB.ItmsGrpNam     AS ItmsGrpNam,
                         CAST(NULL AS NVARCHAR(15))  AS CardCode,
                         CAST(NULL AS NVARCHAR(100)) AS CustomerName,
                         CAST(NULL AS NVARCHAR(20))  AS CustomerPhone,
                         CAST(NULL AS NVARCHAR(10))  AS WhsCode,
-                        CAST(NULL AS NVARCHAR(100)) AS WhsName,
+                        OSRN.Location       AS WhsName,
                         CAST(OSRN.Status AS NVARCHAR(20)) AS Status,
                         'Inventario'        AS Notes
                     FROM OSRN
@@ -807,12 +807,10 @@ def serial_lookup(
                     LEFT JOIN OITB ON OITB.ItmsGrpCod = OITM.ItmsGrpCod
                     WHERE OSRN.DistNumber LIKE ?
                        OR OSRN.MnfSerial  LIKE ?
-                       OR OSRN.IntrSerial LIKE ?
-                       OR OSRN.SuppSerial LIKE ?
                 ) AS Combined
                 ORDER BY Combined.Notes ASC, Combined.SysSerial DESC
                 """,
-                [like, like, like, like, like, like],
+                [like, like, like, like],
             )
 
             results = [
