@@ -38,13 +38,18 @@ def build_bp(row) -> dict:
 
 
 def _keyword_conditions(keyword: str):
-    """Cada palabra busca en CardCode, CardName y LicTradNum."""
+    """Cada palabra busca en CardCode, CardName, LicTradNum (RFC), Phone1 y Cellular."""
     words  = keyword.split()
     clause = " ".join(
-        "AND (CardCode LIKE ? OR CardName LIKE ? OR LicTradNum LIKE ?)"
+        "AND ("
+        "CardCode LIKE ? OR CardName LIKE ? OR LicTradNum LIKE ? "
+        "OR Phone1 LIKE ? OR Cellular LIKE ?"
+        ")"
         for _ in words
     )
-    params = [p for w in words for p in (f"%{w}%", f"%{w}%", f"%{w}%")]
+    params = [p for w in words for p in (
+        f"%{w}%", f"%{w}%", f"%{w}%", f"%{w}%", f"%{w}%",
+    )]
     return clause, params
 
 
