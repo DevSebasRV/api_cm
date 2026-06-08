@@ -780,6 +780,11 @@ def serial_lookup(
                     UNION ALL
 
                     -- 2. Maestro de Series (OSRN) — equipos en inventario sin cliente
+                    --
+                    -- NOTA: OSRN.WhsCode NO existe en esta versión de SAP B1.
+                    -- En B1 ≥ 9.3 PL10 sí, pero acá hay que dejarlo NULL.
+                    -- Si más adelante se necesita el almacén, hay que hacer
+                    -- JOIN a OSRI / SRI1 (movimientos de series con WhsCode).
                     SELECT
                         OSRN.SysSerial      AS SysSerial,
                         OSRN.DistNumber     AS DistNumber,
@@ -790,17 +795,16 @@ def serial_lookup(
                         OSRN.ItemCode       AS ItemCode,
                         OITM.ItemName       AS ItemName,
                         OITB.ItmsGrpNam     AS ItmsGrpNam,
-                        CAST(NULL AS NVARCHAR(15)) AS CardCode,
+                        CAST(NULL AS NVARCHAR(15))  AS CardCode,
                         CAST(NULL AS NVARCHAR(100)) AS CustomerName,
-                        CAST(NULL AS NVARCHAR(20)) AS CustomerPhone,
-                        OSRN.WhsCode        AS WhsCode,
-                        OWHS.WhsName        AS WhsName,
+                        CAST(NULL AS NVARCHAR(20))  AS CustomerPhone,
+                        CAST(NULL AS NVARCHAR(10))  AS WhsCode,
+                        CAST(NULL AS NVARCHAR(100)) AS WhsName,
                         CAST(OSRN.Status AS NVARCHAR(20)) AS Status,
                         'Inventario'        AS Notes
                     FROM OSRN
                     LEFT JOIN OITM ON OITM.ItemCode   = OSRN.ItemCode
                     LEFT JOIN OITB ON OITB.ItmsGrpCod = OITM.ItmsGrpCod
-                    LEFT JOIN OWHS ON OWHS.WhsCode    = OSRN.WhsCode
                     WHERE OSRN.DistNumber LIKE ?
                        OR OSRN.MnfSerial  LIKE ?
                        OR OSRN.IntrSerial LIKE ?
