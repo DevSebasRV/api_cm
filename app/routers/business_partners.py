@@ -224,3 +224,88 @@ def get_business_partners(
         return err(500, f"Error de conexión a SAP B1: {db_err}")
     except Exception as e:
         return err(500, f"Error interno: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Detalle de un socio (más campos que el listado)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SELECT_DETAIL = """
+    SELECT  CardCode,
+            CardName,
+            LicTradNum,
+            Phone1,
+            Cellular,
+            CardType,
+            Balance,
+            E_Mail,
+            Currency,
+            CreateDate,
+            UpdateDate,
+            Notes,
+            MailAddres,
+            MailZipCod,
+            MailCity,
+            MailCountr,
+            U_CVM_REGFISCAL
+    FROM    OCRD
+"""
+
+
+def build_bp_detail(row) -> dict:
+    return {
+        "CardCode":              row.CardCode,
+        "CardName":              row.CardName,
+        "FederalTaxID":          row.LicTradNum,
+        "Phone1":                row.Phone1,
+        "Cellular":              row.Cellular,
+        "CardType":              _TYPE_MAP.get(row.CardType, row.CardType),
+        "CurrentAccountBalance": float(row.Balance) if row.Balance is not None else 0.0,
+        "EmailAddress":          row.E_Mail,
+        "Currency":              row.Currency,
+        "CreateDate":            row.CreateDate.isoformat() if row.CreateDate else None,
+        "UpdateDate":            row.UpdateDate.isoformat() if row.UpdateDate else None,
+        "Notes":                 row.Notes,
+        "BillToAddress":         row.MailAddres,
+        "BillToZipCode":         row.MailZipCod,
+        "BillToCity":            row.MailCity,
+        "BillToCountry":         row.MailCountr,
+        "RegimenFiscal":         row.U_CVM_REGFISCAL,
+    }
+
+
+@router.get(
+    "/businessPartners/{card_code}/detail",
+    summary="Detalle de un socio (más campos que el listado)",
+)
+def get_business_partner_detail(
+    card_code: str,
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    db_key = (x_sap_db or "fn").lower()
+    if db_key not in EMPRESAS:
+        return err(400, f"X-SAP-DB '{x_sap_db}' no válida. Usa: {list(EMPRESAS.keys())}.")
+
+    try:
+        conn   = get_connection(EMPRESAS[db_key])
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                _SELECT_DETAIL + " WHERE CardCode = ? AND CardType = 'C'",
+                [card_code],
+            )
+            row = cursor.fetchone()
+            if not row:
+                return err(404, f"Socio '{card_code}' no encontrado.")
+            return {
+                "success": True,
+                "message": None,
+                "businessPartner": build_bp_detail(row),
+            }
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de conexión a SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
