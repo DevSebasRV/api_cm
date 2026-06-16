@@ -7,7 +7,7 @@ para seleccionar la base SAP B1 contra la que se consulta.
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import pyodbc
 
 from app.config import (
@@ -172,8 +172,40 @@ def check_shopify_enabled(cursor, item_code: str):
 #    Datos maestros de artículo + UDFs para Shopify
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ARTICLES_SELECT = """
-    SELECT
+# Columna (UDF) donde se guardan las URLs de imágenes, una por línea.
+# El campo es opcional: el código detecta si existe y degrada con gracia
+# (no rompe la API antes de que se cree el UDF en SAP).
+IMAGES_COL = "U_Imagenes"
+
+# Cache de existencia de la columna por base de datos (se llena en runtime).
+_IMAGES_COL_CACHE: Dict[str, bool] = {}
+
+
+def _has_images_col(cursor, database: str) -> bool:
+    """¿Existe la columna U_Imagenes en [@SHOPIFY_ARTICLE] de esta base?"""
+    if database in _IMAGES_COL_CACHE:
+        return _IMAGES_COL_CACHE[database]
+    try:
+        cursor.execute(
+            "SELECT 1 FROM sys.columns "
+            "WHERE object_id = OBJECT_ID('[@SHOPIFY_ARTICLE]') AND name = ?",
+            [IMAGES_COL],
+        )
+        exists = cursor.fetchone() is not None
+    except pyodbc.Error:
+        exists = False
+    _IMAGES_COL_CACHE[database] = exists
+    return exists
+
+
+def _parse_images(raw: Optional[str]) -> list:
+    """Texto del UDF (una URL por línea) → lista de URLs limpias (sin vacías)."""
+    if not raw:
+        return []
+    return [u.strip() for u in raw.replace("\r\n", "\n").split("\n") if u.strip()]
+
+
+_ARTICLES_BASE_COLS = """
         Code         AS ItemCode,
         Name         AS ItemName,
         U_Activo     AS Activo,
@@ -185,8 +217,13 @@ _ARTICLES_SELECT = """
         U_Opt2Value  AS Opt2Value,
         U_Opt3Name   AS Opt3Name,
         U_Opt3Value  AS Opt3Value
-    FROM   [@SHOPIFY_ARTICLE]
 """
+
+
+def _articles_select(has_img: bool) -> str:
+    """SELECT de artículos; incluye la columna de imágenes solo si existe."""
+    img = ",\n        U_Imagenes AS ImagesRaw" if has_img else ""
+    return f"SELECT {_ARTICLES_BASE_COLS}{img}\n    FROM [@SHOPIFY_ARTICLE]"
 
 
 def _activo_to_status(flag: Optional[str]) -> str:
@@ -194,13 +231,18 @@ def _activo_to_status(flag: Optional[str]) -> str:
     return "Activa" if (flag or "Y").strip().upper() == "Y" else "Inactiva"
 
 
-def _build_article(row) -> Dict[str, Any]:
+def _build_article(row, has_img: bool) -> Dict[str, Any]:
     """
     Toda la data sale de la UDT @SHOPIFY_ARTICLE.
     Las llaves van sin espacios (Option1Name en vez de "Option1 Name") para
     facilitar el consumo desde código (acceso por atributo / destructuring).
+
+    Imágenes (según pedido):
+      - 1 imagen  → "Imagen":   "url"
+      - >1 imagen → "Imagenes": ["url1", "url2", ...]
+      - 0 imagen  → ninguna de las dos llaves
     """
-    return {
+    art = {
         "Name":          row.ItemName,
         "Status":        _activo_to_status(row.Activo),
         "Vendor":        row.Vendor,
@@ -212,6 +254,13 @@ def _build_article(row) -> Dict[str, Any]:
         "Option3Name":   row.Opt3Name,
         "Option3Value":  row.Opt3Value,
     }
+    if has_img:
+        imgs = _parse_images(row.ImagesRaw)
+        if len(imgs) == 1:
+            art["Imagen"] = imgs[0]
+        elif len(imgs) > 1:
+            art["Imagenes"] = imgs
+    return art
 
 
 @router.get(
@@ -230,11 +279,14 @@ def get_articles(
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
+            has_img = _has_images_col(cursor, database)
+            select  = _articles_select(has_img)
+
             # ── Caso 1: un solo ItemCode ─────────────────────────────────────
             # Devolvemos el item EXISTA O NO sea activo — el campo Status
             # indica al consumer si está Activa/Inactiva.
             if itemCode:
-                cursor.execute(_ARTICLES_SELECT + " WHERE Code = ?", [itemCode])
+                cursor.execute(select + " WHERE Code = ?", [itemCode])
                 row = cursor.fetchone()
                 if not row:
                     return err(
@@ -244,7 +296,7 @@ def get_articles(
                 return {
                     "success":  True,
                     "message":  None,
-                    "articles": { row.ItemCode: _build_article(row) },
+                    "articles": { row.ItemCode: _build_article(row, has_img) },
                 }
 
             # ── Caso 2: listado paginado (activos + inactivos) ─────────────
@@ -253,11 +305,14 @@ def get_articles(
 
             offset = (page - 1) * pageSize
             cursor.execute(
-                _ARTICLES_SELECT
+                select
                 + " ORDER BY Code OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
                 [offset, pageSize],
             )
-            articles = { row.ItemCode: _build_article(row) for row in cursor.fetchall() }
+            articles = {
+                row.ItemCode: _build_article(row, has_img)
+                for row in cursor.fetchall()
+            }
 
             return {
                 "success":    True,
@@ -301,6 +356,16 @@ class ArticleIn(BaseModel):
     opt3Name:   Optional[str] = PydField(None, max_length=50)
     opt3Value:  Optional[str] = PydField(None, max_length=50)
     activo:     Optional[str] = PydField(None, pattern=r"^[YN]$")
+    # URLs de imágenes. None = no tocar (en update); [] = limpiar.
+    imagenes:   Optional[List[str]] = PydField(None)
+
+
+def _join_images(urls: Optional[List[str]]) -> Optional[str]:
+    """Lista de URLs → texto con una URL por línea (o None si vacía)."""
+    if not urls:
+        return None
+    clean = [u.strip() for u in urls if u and u.strip()]
+    return "\n".join(clean) if clean else None
 
 
 @router.post(
@@ -323,28 +388,32 @@ def create_article(
             if cursor.fetchone():
                 return err(409, f"Ya existe un artículo con SKU '{payload.code}'.")
 
+            cols = ["Code", "Name", "U_Vendor", "U_Type",
+                    "U_Opt1Name", "U_Opt1Value",
+                    "U_Opt2Name", "U_Opt2Value",
+                    "U_Opt3Name", "U_Opt3Value", "U_Activo"]
+            vals = [
+                payload.code,
+                payload.name      or None,
+                payload.vendor    or None,
+                payload.type      or None,
+                payload.opt1Name  or None,
+                payload.opt1Value or None,
+                payload.opt2Name  or None,
+                payload.opt2Value or None,
+                payload.opt3Name  or None,
+                payload.opt3Value or None,
+                (payload.activo or "Y").upper(),
+            ]
+            # Imágenes: solo si el UDF existe en esta base
+            if _has_images_col(cursor, database):
+                cols.append(IMAGES_COL)
+                vals.append(_join_images(payload.imagenes))
+
+            placeholders = ", ".join("?" * len(cols))
             cursor.execute(
-                """
-                INSERT INTO [@SHOPIFY_ARTICLE]
-                       (Code, Name, U_Vendor, U_Type,
-                        U_Opt1Name, U_Opt1Value,
-                        U_Opt2Name, U_Opt2Value,
-                        U_Opt3Name, U_Opt3Value, U_Activo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    payload.code,
-                    payload.name      or None,
-                    payload.vendor    or None,
-                    payload.type      or None,
-                    payload.opt1Name  or None,
-                    payload.opt1Value or None,
-                    payload.opt2Name  or None,
-                    payload.opt2Value or None,
-                    payload.opt3Name  or None,
-                    payload.opt3Value or None,
-                    (payload.activo or "Y").upper(),
-                ],
+                f"INSERT INTO [@SHOPIFY_ARTICLE] ({', '.join(cols)}) VALUES ({placeholders})",
+                vals,
             )
             conn.commit()
             return {"success": True, "message": None, "code": payload.code}
@@ -395,6 +464,11 @@ def update_article(
                     sets.append(f"{col} = ?")
                     # Strings vacíos → NULL para no ensuciar la tabla
                     params.append(val if val != "" else None)
+
+            # Imágenes: solo si el UDF existe y el payload las trae (None = no tocar)
+            if payload.imagenes is not None and _has_images_col(cursor, database):
+                sets.append(f"{IMAGES_COL} = ?")
+                params.append(_join_images(payload.imagenes))
 
             if not sets:
                 return err(400, "No se mandó ningún campo para actualizar.")
