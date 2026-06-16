@@ -852,7 +852,7 @@ def serial_lookup(
 
 
 @router.get(
-    "/serviceCalls/validateCodes",
+    "/serviceCallValidateCodes",
     summary="Valida que los códigos de una orden existan en SAP (para dar errores precisos)",
 )
 def validate_service_call_codes(
