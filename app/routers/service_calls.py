@@ -852,6 +852,57 @@ def serial_lookup(
 
 
 @router.get(
+    "/serviceCalls/validateCodes",
+    summary="Valida que los códigos de una orden existan en SAP (para dar errores precisos)",
+)
+def validate_service_call_codes(
+    cardCode:    Optional[str] = Query(default=None),
+    itemCode:    Optional[str] = Query(default=None),
+    assignee:    Optional[int] = Query(default=None),
+    technician:  Optional[int] = Query(default=None),
+    origin:      Optional[int] = Query(default=None),
+    problemType: Optional[int] = Query(default=None),
+    x_sap_db:    Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Revisa cada código contra su tabla en SAP y devuelve los que NO existen,
+    para que el portal muestre un error específico en vez del genérico -2028.
+
+    Los nombres de tabla/columna son fijos (no input) → seguro contra inyección.
+    """
+    _, database = resolve_db(x_sap_db)
+
+    # (campo, valor, tabla, columna, etiqueta legible)
+    checks = [
+        ("cardCode",    cardCode,    "OCRD", "CardCode",   "Cliente"),
+        ("itemCode",    itemCode,    "OITM", "ItemCode",   "Artículo (SKU)"),
+        ("assignee",    assignee,    "OHEM", "empID",      "Asesor de servicio"),
+        ("technician",  technician,  "OHEM", "empID",      "Técnico"),
+        ("origin",      origin,      "OSCO", "originID",   "Origen"),
+        ("problemType", problemType, "OSCP", "prblmTypID", "Tipo de problema"),
+    ]
+
+    invalid = []
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            for field, value, table, col, label in checks:
+                if value is None or value == "":
+                    continue
+                cursor.execute(f"SELECT 1 FROM {table} WHERE {col} = ?", [value])
+                if not cursor.fetchone():
+                    invalid.append({"field": field, "value": value, "label": label})
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error al validar códigos: {db_err}")
+
+    return {"success": True, "valid": len(invalid) == 0, "invalid": invalid}
+
+
+@router.get(
     "/serviceCallCatalogs",
     summary="Catálogos necesarios para crear una orden de servicio (origenes, tipos, técnicos, status, series)",
 )
