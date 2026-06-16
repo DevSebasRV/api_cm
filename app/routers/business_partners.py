@@ -97,6 +97,57 @@ def err(status: int, message: str):
 
 
 @router.get(
+    "/businessPartners/byRfc",
+    summary="Busca socios por RFC exacto (OCRD.LicTradNum) — para validar duplicados",
+)
+def get_bp_by_rfc(
+    rfc:      str           = Query(..., min_length=1, description="RFC exacto a buscar (LicTradNum)"),
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Devuelve los socios cuyo LicTradNum (RFC) coincide exactamente con el dado.
+    Lo usa el portal antes de crear/editar un socio para evitar RFC duplicados.
+
+    Respuesta: { success, matches: [{CardCode, CardName, FederalTaxID, CardType}] }
+    """
+    db_key = (x_sap_db or "fn").lower()
+    if db_key not in EMPRESAS:
+        return err(400, f"X-SAP-DB '{x_sap_db}' no válida. Usa: {list(EMPRESAS.keys())}.")
+
+    rfc_clean = rfc.strip().upper()
+
+    try:
+        conn   = get_connection(EMPRESAS[db_key])
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT CardCode, CardName, LicTradNum, CardType
+                FROM   OCRD
+                WHERE  UPPER(LTRIM(RTRIM(LicTradNum))) = ?
+                """,
+                [rfc_clean],
+            )
+            matches = [
+                {
+                    "CardCode":     r.CardCode,
+                    "CardName":     r.CardName,
+                    "FederalTaxID": r.LicTradNum,
+                    "CardType":     _TYPE_MAP.get(r.CardType, r.CardType),
+                }
+                for r in cursor.fetchall()
+            ]
+            return {"success": True, "message": None, "matches": matches}
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error al consultar SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
+@router.get(
     "/businessPartners/nextCode",
     summary="Devuelve el próximo CardCode disponible para Clientes (formato C##### sequencial)",
 )
