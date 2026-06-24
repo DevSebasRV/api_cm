@@ -22,9 +22,10 @@ Y para los documentos vinculados (vía SCL3.ObjType + DocEntry):
 from fastapi import APIRouter, Header, Query
 from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any, List
+import datetime
 import pyodbc
 
-from app.config import EMPRESAS
+from app.config import EMPRESAS, PRICE_LIST_CODE
 from app.database import get_connection
 from app.routers.shopify import resolve_db, err, _pagination  # reutilizamos helpers
 
@@ -490,8 +491,9 @@ def _fetch_related_documents(
 
     # ── Mecanismo 2: Heurística por cliente + fechas ────────────────────────
     if card_code and create_date is not None:
-        # Si la orden está abierta (sin closeDate), usamos createDate como tope.
-        date_to = close_date if close_date is not None else create_date
+        # Orden cerrada → hasta su fecha de cierre. Orden ABIERTA → hasta HOY,
+        # para que las ofertas creadas después (ej. desde el portal) aparezcan.
+        date_to = close_date if close_date is not None else datetime.date.today()
 
         for obj_type, _, head_table, type_label in doc_specs:
             try:
@@ -731,14 +733,11 @@ def serial_lookup(
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
 ):
     """
-    Busca en OSRN cruzando con OITM (artículo) y OCRD (cliente actual).
-    Devuelve hasta 20 coincidencias para que el usuario elija.
-
-    Campos buscados (con LIKE %x%):
-      - OSRN.DistNumber  (Número de distribución / serie principal)
-      - OSRN.MnfSerial   (Serie de fabricante)
-      - OSRN.IntrSerial  (Serie interna)
-      - OSRN.SuppSerial  (Serie del proveedor)
+    Busca SOLO tarjetas de equipo (OINS) por EXACTAMENTE 3 criterios:
+      1. Últimos 5 dígitos EXACTOS del VIN  ->  RIGHT(OINS.internalSN, 5) = texto
+      2. Celular del cliente                ->  OCRD.Cellular LIKE %texto%
+      3. Nombre del cliente                 ->  OCRD.CardName LIKE %texto%
+    Devuelve hasta 20 coincidencias. NO busca por número de motor ni inventario.
     """
     _, database = resolve_db(x_sap_db)
 
@@ -746,71 +745,42 @@ def serial_lookup(
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
-            like = f"%{serial}%"
-            # Estrategia segura: solo dos tablas que sabemos que existen.
-            #   1. OINS — Tarjetas de Equipo (series ya entregadas a clientes)
-            #   2. OSRN — Maestro de números de serie (incluye los en inventario)
-            # OSRN no tiene columna de cliente, así que ahí dejamos NULL.
+            vin5 = serial.strip()            # para los últimos 5 dígitos EXACTOS
+            like = f"%{serial.strip()}%"     # para nombre y celular del cliente
             cursor.execute(
                 """
-                SELECT TOP 20 * FROM (
-                    -- 1. Tarjetas de Equipo (OINS) — equipos en posesión del cliente
-                    SELECT
-                        OINS.insID          AS SysSerial,
-                        OINS.internalSN     AS DistNumber,
-                        OINS.manufSN        AS MnfSerial,
-                        OINS.internalSN     AS IntrSerial,
-                        CAST(NULL AS NVARCHAR(50)) AS SuppSerial,
-                        CAST(NULL AS NVARCHAR(50)) AS Lot,
-                        OINS.itemCode       AS ItemCode,
-                        OINS.itemName       AS ItemName,
-                        OITB.ItmsGrpNam     AS ItmsGrpNam,
-                        OINS.customer       AS CardCode,
-                        OINS.custmrName     AS CustomerName,
-                        OINS.cntctPhone     AS CustomerPhone,
-                        CAST(NULL AS NVARCHAR(10)) AS WhsCode,
-                        CAST(NULL AS NVARCHAR(100)) AS WhsName,
-                        CAST(OINS.status AS NVARCHAR(20)) AS Status,
-                        'Tarjeta de Equipo' AS Notes
-                    FROM OINS
-                    LEFT JOIN OITB ON OITB.ItmsGrpCod = OINS.itemGroup
-                    WHERE OINS.internalSN LIKE ?
-                       OR OINS.manufSN    LIKE ?
-
-                    UNION ALL
-
-                    -- 2. Maestro de Series (OSRN) — equipos en inventario
-                    --
-                    -- Columnas verificadas vía INFORMATION_SCHEMA en ESTA DB:
-                    --   SysNumber (no SysSerial), LotNumber (no Lot),
-                    --   itemName en minúscula, Location en vez de WhsCode.
-                    --   NO existen: IntrSerial, SuppSerial, WhsCode, CardCode.
-                    SELECT
-                        OSRN.SysNumber      AS SysSerial,
-                        OSRN.DistNumber     AS DistNumber,
-                        OSRN.MnfSerial      AS MnfSerial,
-                        CAST(NULL AS NVARCHAR(50))  AS IntrSerial,
-                        CAST(NULL AS NVARCHAR(50))  AS SuppSerial,
-                        OSRN.LotNumber      AS Lot,
-                        OSRN.ItemCode       AS ItemCode,
-                        ISNULL(OITM.ItemName, OSRN.itemName) AS ItemName,
-                        OITB.ItmsGrpNam     AS ItmsGrpNam,
-                        CAST(NULL AS NVARCHAR(15))  AS CardCode,
-                        CAST(NULL AS NVARCHAR(100)) AS CustomerName,
-                        CAST(NULL AS NVARCHAR(20))  AS CustomerPhone,
-                        CAST(NULL AS NVARCHAR(10))  AS WhsCode,
-                        OSRN.Location       AS WhsName,
-                        CAST(OSRN.Status AS NVARCHAR(20)) AS Status,
-                        'Inventario'        AS Notes
-                    FROM OSRN
-                    LEFT JOIN OITM ON OITM.ItemCode   = OSRN.ItemCode
-                    LEFT JOIN OITB ON OITB.ItmsGrpCod = OITM.ItmsGrpCod
-                    WHERE OSRN.DistNumber LIKE ?
-                       OR OSRN.MnfSerial  LIKE ?
-                ) AS Combined
-                ORDER BY Combined.Notes ASC, Combined.SysSerial DESC
+                SELECT TOP 20
+                    OINS.insID          AS SysSerial,
+                    OINS.internalSN     AS DistNumber,
+                    OINS.manufSN        AS MnfSerial,
+                    OINS.internalSN     AS IntrSerial,
+                    CAST(NULL AS NVARCHAR(50)) AS SuppSerial,
+                    CAST(NULL AS NVARCHAR(50)) AS Lot,
+                    OINS.itemCode       AS ItemCode,
+                    OINS.itemName       AS ItemName,
+                    OITB.ItmsGrpNam     AS ItmsGrpNam,
+                    OINS.customer       AS CardCode,
+                    OINS.custmrName     AS CustomerName,
+                    ISNULL(OCRD.Cellular, OCRD.Phone1) AS CustomerPhone,
+                    CAST(NULL AS NVARCHAR(10)) AS WhsCode,
+                    CAST(NULL AS NVARCHAR(100)) AS WhsName,
+                    CAST(OINS.status AS NVARCHAR(20)) AS Status,
+                    OINS.U_Ps_Marca     AS VehBrand,   -- Marca (KTM, Honda…)
+                    OINS.U_Ps_SubMarca  AS VehModel,   -- Modelo (DUKE, NINJA 400…)
+                    CAST(OINS.U_Ps_Modelo AS NVARCHAR(10)) AS VehYear,  -- Año (2026)
+                    OINS.U_Ps_Placa     AS VehPlate,   -- Placa
+                    'Tarjeta de Equipo' AS Notes
+                FROM OINS
+                LEFT JOIN OITB ON OITB.ItmsGrpCod = OINS.itemGroup
+                LEFT JOIN OCRD ON OCRD.CardCode   = OINS.customer
+                -- EXACTAMENTE 3 criterios (lo que pidió el usuario):
+                WHERE RIGHT(RTRIM(OINS.internalSN), 5) = ?   -- 1) VIN: últimos 5 dígitos exactos
+                   OR OCRD.Cellular = ?                       -- 2) celular del cliente (exacto)
+                   OR OCRD.CardName LIKE ?                    -- 3) nombre del cliente (parcial)
+                ORDER BY OINS.insID DESC
                 """,
-                [like, like, like, like],
+                # VIN-últimos5 y celular usan el texto tal cual; nombre va con %…%
+                [vin5, vin5, like],
             )
 
             results = [
@@ -831,6 +801,11 @@ def serial_lookup(
                     "WhsName":      r.WhsName,
                     "Status":       r.Status,
                     "Notes":        r.Notes,
+                    # Datos de vehículo desde los UDF de la tarjeta de equipo (OINS)
+                    "Brand":        r.VehBrand,
+                    "Model":        r.VehModel,
+                    "Year":         r.VehYear,
+                    "LicensePlate": r.VehPlate,
                 }
                 for r in cursor.fetchall()
             ]
@@ -954,6 +929,29 @@ def get_catalogs(
                 for r in cursor.fetchall()
             ]
 
+            # Técnicos: SAP exige que el empleado de OSCL.technician tenga "rol de
+            # técnico". Esa marca NO es una columna simple de OHEM; el set fiable
+            # son los empleados ACTIVOS que ya se han usado como técnico (probado:
+            # SAP los acepta y rechaza al resto con "must be defined as technician").
+            # El asesor (OSCL.assignee) NO tiene esa regla → usa `employees`.
+            try:
+                cursor.execute(
+                    "SELECT empID, firstName, lastName "
+                    "FROM   OHEM "
+                    "WHERE  ISNULL(Active,'Y')='Y' "
+                    "  AND  empID IN (SELECT DISTINCT technician FROM OSCL WHERE technician IS NOT NULL) "
+                    "ORDER BY firstName, lastName"
+                )
+                technicians = [
+                    {
+                        "id":   int(r.empID),
+                        "name": (f"{r.firstName or ''} {r.lastName or ''}").strip() or f"#{r.empID}",
+                    }
+                    for r in cursor.fetchall()
+                ]
+            except pyodbc.Error:
+                technicians = employees   # fallback: si falla, no bloqueamos
+
             # Series para ServiceCalls (ObjectCode=191)
             try:
                 cursor.execute(
@@ -972,6 +970,7 @@ def get_catalogs(
                 "problems":  problems,
                 "statuses":  statuses,
                 "employees": employees,
+                "technicians": technicians,
                 "series":    series,
                 "priorities": [
                     {"id": "L", "name": "Baja"},
@@ -1045,3 +1044,116 @@ def list_customer_equipment(
         return err(500, f"Error de SAP B1: {db_err}")
     except Exception as e:
         return err(500, f"Error interno: {e}")
+
+
+@router.get(
+    "/quoteArticleSearch",
+    summary="Busca artículos por código o nombre (con precio de lista) para armar ofertas",
+)
+def quote_article_search(
+    keyword:  str           = Query(..., min_length=2, description="Texto: busca en ItemCode e ItemName"),
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Devuelve hasta 25 artículos vendibles (OITM.SellItem='Y', no cancelados) que
+    coincidan con el texto en código o nombre, con su precio de la lista
+    PRICE_LIST_CODE (ITM1). Cada palabra debe coincidir (AND).
+    """
+    _, database = resolve_db(x_sap_db)
+    words = [w for w in keyword.strip().split() if w]
+    if not words:
+        return {"success": True, "articles": []}
+
+    clause = " AND ".join("(OITM.ItemCode LIKE ? OR OITM.ItemName LIKE ?)" for _ in words)
+    params: list = [PRICE_LIST_CODE]
+    for w in words:
+        like = f"%{w}%"
+        params += [like, like]
+
+    sql = f"""
+        SELECT TOP 25
+            OITM.ItemCode,
+            OITM.ItemName,
+            OITM.OnHand,
+            ISNULL(ITM1.Price, 0) AS Price
+        FROM   OITM
+        LEFT   JOIN ITM1 ON ITM1.ItemCode = OITM.ItemCode AND ITM1.PriceList = ?
+        WHERE  ISNULL(OITM.Canceled,'N') = 'N'
+          AND  ISNULL(OITM.SellItem,'Y') = 'Y'
+          AND  {clause}
+        ORDER BY OITM.ItemCode
+    """
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(sql, params)
+            articles = [
+                {
+                    "ItemCode": r.ItemCode,
+                    "ItemName": r.ItemName,
+                    "Price":    float(r.Price)  if r.Price  is not None else 0.0,
+                    "OnHand":   float(r.OnHand) if r.OnHand is not None else 0.0,
+                }
+                for r in cursor.fetchall()
+            ]
+        finally:
+            cursor.close()
+            conn.close()
+        return {"success": True, "articles": articles}
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+
+
+@router.get(
+    "/salespersonSearch",
+    summary="Busca vendedores (OSLP) con su almacén asignado, para crear ofertas",
+)
+def salesperson_search(
+    keyword:  str           = Query(..., min_length=1, description="Texto: busca en nombre o código del vendedor"),
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    SAP (add-on CVMSales) exige un vendedor en la Oferta y ata el almacén
+    permitido a `OSLP.Telephone`:
+      - Si Telephone contiene '.', el vendedor es EXENTO (cualquier almacén).
+      - Si no, el almacén de las líneas debe ser ese (su almacén asignado).
+    Devolvemos eso para que el portal ajuste el almacén según el vendedor elegido.
+    """
+    _, database = resolve_db(x_sap_db)
+    like = f"%{keyword.strip()}%"
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT TOP 25 SlpCode, SlpName, Telephone
+                FROM   OSLP
+                WHERE  ISNULL(Active,'Y') = 'Y'
+                  AND  SlpCode >= 0
+                  AND  (SlpName LIKE ? OR CAST(SlpCode AS NVARCHAR(20)) LIKE ?)
+                ORDER BY SlpName
+                """,
+                [like, like],
+            )
+            rows = cursor.fetchall()
+            # ¿qué Telephone son códigos de almacén reales?
+            whs_codes = {r[0] for r in cursor.execute("SELECT WhsCode FROM OWHS").fetchall()}
+            salespeople = []
+            for r in rows:
+                tel = (r.Telephone or "").strip()
+                exempt = "." in tel
+                warehouse = tel if (tel in whs_codes and not exempt) else None
+                salespeople.append({
+                    "SlpCode":   int(r.SlpCode),
+                    "SlpName":   r.SlpName,
+                    "Warehouse": warehouse,   # almacén fijo (None si exento)
+                    "Exempt":    exempt,      # True = puede cualquier almacén
+                })
+        finally:
+            cursor.close()
+            conn.close()
+        return {"success": True, "salespeople": salespeople}
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")

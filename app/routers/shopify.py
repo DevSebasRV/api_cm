@@ -237,10 +237,9 @@ def _build_article(row, has_img: bool) -> Dict[str, Any]:
     Las llaves van sin espacios (Option1Name en vez de "Option1 Name") para
     facilitar el consumo desde código (acceso por atributo / destructuring).
 
-    Imágenes (según pedido):
-      - 1 imagen  → "Imagen":   "url"
-      - >1 imagen → "Imagenes": ["url1", "url2", ...]
-      - 0 imagen  → ninguna de las dos llaves
+    Imágenes: SIEMPRE se devuelve la llave "Images" como ARRAY:
+      - 0 imágenes (o el UDF no existe en esta base) → "Images": []
+      - 1 o más                                      → "Images": ["url1", ...]
     """
     art = {
         "Name":          row.ItemName,
@@ -253,13 +252,9 @@ def _build_article(row, has_img: bool) -> Dict[str, Any]:
         "Option2Value":  row.Opt2Value,
         "Option3Name":   row.Opt3Name,
         "Option3Value":  row.Opt3Value,
+        # Siempre array: vacío si la base no tiene el UDF o el artículo no tiene imágenes.
+        "Images":        _parse_images(row.ImagesRaw) if has_img else [],
     }
-    if has_img:
-        imgs = _parse_images(row.ImagesRaw)
-        if len(imgs) == 1:
-            art["Imagen"] = imgs[0]
-        elif len(imgs) > 1:
-            art["Imagenes"] = imgs
     return art
 
 
