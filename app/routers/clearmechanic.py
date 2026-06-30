@@ -173,6 +173,8 @@ def _build_order_json(row, phase: str) -> dict:
 def create_cm_order(
     folio:        str           = Body(..., embed=True, description="Número de ODS / folio en SAP"),
     repairShopId: int           = Body(..., embed=True, description="ID del taller en CM (asociado al usuario)"),
+    # Número de cita de ClearMechanic: liga la orden a una cita existente en CM.
+    appointmentNumber: Optional[str] = Body(default=None, embed=True, description="Número de cita de CM a ligar"),
     # Datos del vehículo que captura el portal. En SAP no se guardan de forma
     # confiable (campos no escribibles vía SL), por eso viajan directo a CM.
     brand:        Optional[str] = Body(default=None, embed=True, description="Marca de la moto"),
@@ -223,6 +225,10 @@ def create_cm_order(
     if model:        payload["model"]        = model
     if year:         payload["year"]         = year
     if licensePlate: payload["licensePlate"] = licensePlate
+
+    # Número de cita de CM → liga la orden a la cita existente en ClearMechanic.
+    if appointmentNumber:
+        payload["appointmentNumber"] = str(appointmentNumber).strip()
 
     # CM exige 'year' entero. Si viene algo no numérico (del form o del SQL),
     # lo mandamos como None en vez de romper toda la orden.
