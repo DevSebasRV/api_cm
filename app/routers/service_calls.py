@@ -23,6 +23,7 @@ from fastapi import APIRouter, Header, Query
 from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any, List
 import datetime
+import re
 import pyodbc
 
 from app.config import EMPRESAS, PRICE_LIST_CODE
@@ -518,6 +519,47 @@ def _fetch_related_documents(
                         seen.add(key)
             except pyodbc.Error:
                 pass
+
+    # ── Mecanismo 3: marcador del portal en Comments ("ODS #<callId>") ───────
+    # Determinístico para documentos creados desde el portal. NO depende de
+    # fechas, así que liga las ofertas aunque la orden ya tenga closeDate y el
+    # documento se haya creado DESPUÉS de esa fecha (caso que la heurística por
+    # rango de fechas se perdía). El marcador lo estampa create-quote-action.
+    marker_like = f"%ODS #{call_id}%"
+    # Evita que, p.ej., la orden 7006 capture documentos de la 70065.
+    marker_re = re.compile(rf"ODS\s*#?\s*{call_id}(?:\D|$)")
+    for obj_type, _, head_table, type_label in doc_specs:
+        try:
+            if create_date is not None:
+                cursor.execute(
+                    f"""
+                    SELECT DocEntry, ISNULL(Comments, '') AS Comments
+                    FROM   {head_table}
+                    WHERE  Comments LIKE ? AND DocDate >= ?
+                    """,
+                    [marker_like, create_date],
+                )
+            else:
+                cursor.execute(
+                    f"""
+                    SELECT DocEntry, ISNULL(Comments, '') AS Comments
+                    FROM   {head_table}
+                    WHERE  Comments LIKE ?
+                    """,
+                    [marker_like],
+                )
+            for r in cursor.fetchall():
+                key = (obj_type, int(r.DocEntry))
+                if key in seen:
+                    continue
+                if not marker_re.search(r.Comments or ""):
+                    continue  # descarta falsos positivos del LIKE (#7006 vs #70065)
+                doc = _fetch_document(cursor, obj_type, int(r.DocEntry))
+                if doc:
+                    grouped[type_label].append(doc)
+                    seen.add(key)
+        except pyodbc.Error:
+            pass
 
     return grouped
 
