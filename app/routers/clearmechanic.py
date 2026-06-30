@@ -39,10 +39,26 @@ _PHASE_BY_SHOP = {
     4105: {"21": "22212"},   # Roma — status SAP 21 = "Esperando Rampa"
 }
 
+# Fase de ENTRADA por taller. Una orden recién creada en el portal entra en esta
+# fase sin importar su status SAP (el form crea con status -3 "Abierto" por
+# defecto, que no tiene override). El phaseId es distinto en cada taller.
+#   Roma (4105) → 22212 "Esperando Rampa".
+# Saca los phaseId de un taller con GET /api/cm/phases?workshopId=<GUID>.
+_DEFAULT_PHASE_BY_SHOP = {
+    4105: "22212",   # Roma — "Esperando Rampa"
+}
+
 
 def _resolve_phase(repair_shop_id: int, status_raw: str) -> Optional[str]:
-    """phaseId de CM para (taller, status SAP). None si el taller no está mapeado."""
-    return _PHASE_BY_SHOP.get(int(repair_shop_id), {}).get(str(status_raw))
+    """phaseId de CM para (taller, status SAP).
+    1) override explícito por status en _PHASE_BY_SHOP, si existe;
+    2) si no, la fase de ENTRADA del taller (_DEFAULT_PHASE_BY_SHOP);
+    3) None solo si el taller no tiene NINGUNA fase configurada."""
+    sid = int(repair_shop_id)
+    override = _PHASE_BY_SHOP.get(sid, {}).get(str(status_raw))
+    if override is not None:
+        return override
+    return _DEFAULT_PHASE_BY_SHOP.get(sid)
 
 
 def _to_int_or_none(v: Any) -> Optional[int]:
@@ -212,8 +228,8 @@ def create_cm_order(
     if phase is None:
         return err(
             400,
-            f"El taller {repairShopId} no tiene configurada la fase de CM para el "
-            f"status SAP '{status_raw}'. Agrégalo en _PHASE_BY_SHOP "
+            f"El taller {repairShopId} no tiene fase de CM configurada. "
+            f"Agrégalo en _DEFAULT_PHASE_BY_SHOP "
             f"(saca el phaseId con GET /api/cm/phases?workshopId=<GUID>).",
         )
 
