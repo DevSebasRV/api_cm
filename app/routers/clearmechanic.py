@@ -22,6 +22,7 @@ import datetime
 import json
 import urllib.request
 import urllib.error
+import urllib.parse
 import pyodbc
 
 from app.config import EMPRESAS, CM_LOGIN_URL, CM_ORDERS_URL, CM_USER, CM_PASSWORD
@@ -133,6 +134,19 @@ def _http_post_json(url: str, payload: dict, headers: Optional[dict] = None):
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, data=data, headers=h, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as e:
+        return 0, str(e)
+
+
+def _http_get_json(url: str, headers: Optional[dict] = None):
+    """GET con urllib. Devuelve (status_code, texto_respuesta)."""
+    h = dict(headers or {})
+    req = urllib.request.Request(url, headers=h, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.status, resp.read().decode("utf-8", errors="replace")
@@ -289,3 +303,77 @@ def create_cm_order(
         f"ClearMechanic rechazó la orden (HTTP {status}): {detail}",
         {"repairShopId": repairShopId, "sentPayload": payload},
     )
+
+
+@router.get(
+    "/orders/{folio}/inspection",
+    summary="Puntos de inspección (inspectionItems) de una orden en ClearMechanic",
+)
+def get_cm_inspection(folio: str, repairShopId: int):
+    """Consulta GET /cm/orders/{folio}?repairShopId=X en CM y devuelve sus
+    puntos de inspección + contadores de color. El orderNumber de CM = CallID SAP.
+    Si la orden aún no existe en CM (o sin inspección), devuelve items vacío."""
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado (faltan CM_USER / CM_PASSWORD en .env).")
+
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+
+    url = f"{CM_ORDERS_URL}/{urllib.parse.quote(str(folio))}?repairShopId={int(repairShopId)}"
+    status, body = _http_get_json(url, {"Authorization": f"Bearer {token}"})
+
+    # La orden todavía no está en CM (no sincronizada / sin inspección hecha).
+    if status == 404:
+        return {
+            "success": True, "message": None,
+            "data": {"orderNumber": str(folio), "notInCm": True,
+                     "inspectionFormStatus": None,
+                     "counts": {"green": 0, "yellow": 0, "red": 0}, "items": []},
+        }
+
+    if status not in (200, 201):
+        detail = body
+        try:
+            detail = json.loads(body).get("message", body)
+        except Exception:
+            pass
+        return err(502, f"ClearMechanic rechazó la consulta (HTTP {status}): {detail}")
+
+    try:
+        data = json.loads(body).get("data", {}) or {}
+    except Exception:
+        return err(502, "Respuesta inválida de ClearMechanic.")
+
+    items = []
+    for it in (data.get("inspectionItems") or []):
+        if not isinstance(it, dict):
+            continue
+        items.append({
+            "id":             it.get("cmosInspectionItemId"),
+            "name":           it.get("inspectionItemName"),
+            "priority":       it.get("priority"),          # Low | Med | Urgent → color en el front
+            "approvalStatus": it.get("approvalStatus"),    # Pending | Approved | Rejected
+            "comments":       it.get("comments") or it.get("inspectionItemComments") or "",
+            "quantity":       it.get("quantity"),
+            "partUnitPrice":  it.get("partUnitPrice"),
+            "laborHours":     it.get("laborHours"),
+            "laborHourPrice": it.get("laborHourPrice"),
+            "parts":          it.get("parts") or [],
+            "labors":         it.get("labors") or [],
+        })
+
+    return {
+        "success": True, "message": None,
+        "data": {
+            "orderNumber":          str(data.get("orderNumber") or folio),
+            "inspectionFormStatus": data.get("inspectionFormStatus"),
+            "notInCm":              False,
+            "counts": {
+                "green":  data.get("greenItemsCount") or 0,
+                "yellow": data.get("yellowItemsCount") or 0,
+                "red":    data.get("redItemsCount") or 0,
+            },
+            "items": items,
+        },
+    }
