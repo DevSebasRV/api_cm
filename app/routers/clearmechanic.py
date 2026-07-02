@@ -49,6 +49,16 @@ _DEFAULT_PHASE_BY_SHOP = {
     4105: "22212",   # Roma — "Esperando Rampa"
 }
 
+# workshopId (GUID) por taller. El POST/PATCH de inspectionItems exige el GUID en
+# query (NO el repairShopId numérico). Para agregar un taller, saca su GUID con
+# GET /api/cm/phases?workshopId=<GUID> (aparece en el error si mandas fase inválida).
+_WORKSHOP_GUID_BY_SHOP = {
+    4105: "5950971e-41c4-4202-bf54-8b4514768163",   # Roma
+}
+
+# Color del portal → priority de CM. Rojo=Urgent, Amarillo=Med, Verde=Low.
+_PRIORITY_VALUES = {"Low", "Med", "Urgent"}
+
 
 def _resolve_phase(repair_shop_id: int, status_raw: str) -> Optional[str]:
     """phaseId de CM para (taller, status SAP).
@@ -147,6 +157,22 @@ def _http_get_json(url: str, headers: Optional[dict] = None):
     """GET con urllib. Devuelve (status_code, texto_respuesta)."""
     h = dict(headers or {})
     req = urllib.request.Request(url, headers=h, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as e:
+        return 0, str(e)
+
+
+def _http_patch_json(url: str, payload: dict, headers: Optional[dict] = None):
+    """PATCH JSON con urllib. Devuelve (status_code, texto_respuesta)."""
+    data = json.dumps(payload).encode("utf-8")
+    h = {"Content-Type": "application/json"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, data=data, headers=h, method="PATCH")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.status, resp.read().decode("utf-8", errors="replace")
@@ -377,3 +403,120 @@ def get_cm_inspection(folio: str, repairShopId: int):
             "items": items,
         },
     }
+
+
+def _estimates_for_cm(estimates) -> list:
+    """Mapea los artículos/kits del portal al formato estimates[] de CM."""
+    out = []
+    for e in (estimates or []):
+        if not isinstance(e, dict):
+            continue
+        price = e.get("unitPrice")
+        if price is None:
+            price = e.get("UnitPrice", 0)
+        out.append({
+            "estimateName": e.get("estimateName") or e.get("name") or e.get("itemCode") or "",
+            "partId":       e.get("partId") or e.get("itemCode") or "",
+            "quantity":     int(e.get("quantity") or 1),
+            "UnitPrice":    float(price or 0),
+        })
+    return out
+
+
+@router.post(
+    "/orders/{folio}/inspection",
+    summary="Crea un punto de inspección (inspectionItem) en ClearMechanic",
+)
+def create_inspection_item(
+    folio:          str,
+    repairShopId:   int           = Body(..., embed=True, description="ID numérico del taller"),
+    name:           str           = Body(..., embed=True, description="Nombre del punto de inspección"),
+    priority:       str           = Body(..., embed=True, description="Low | Med | Urgent (color)"),
+    approvalStatus: str           = Body(default="Pending", embed=True),
+    comments:       Optional[str] = Body(default=None, embed=True),
+    estimates:      list          = Body(default=[], embed=True, description="Artículos/kits {itemCode,name,quantity,unitPrice}"),
+):
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado (faltan CM_USER / CM_PASSWORD).")
+    guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
+    if not guid:
+        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado en _WORKSHOP_GUID_BY_SHOP.")
+    if priority not in _PRIORITY_VALUES:
+        return err(400, f"priority inválido '{priority}'. Usa: Low | Med | Urgent.")
+
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+
+    body = {
+        "inspectionItemName": str(name),
+        "priority":           priority,
+        "approvalStatus":     approvalStatus or "Pending",
+        "isVisible":          True,
+        "estimates":          _estimates_for_cm(estimates),
+    }
+    if comments:
+        body["comments"] = [str(comments)]
+
+    url = f"{CM_ORDERS_URL}/{urllib.parse.quote(str(folio))}/inspectionItems?workshopId={guid}"
+    status, resp = _http_post_json(url, body, {"Authorization": f"Bearer {token}"})
+    if status in (200, 201):
+        data = None
+        try:
+            data = json.loads(resp).get("data")
+        except Exception:
+            pass
+        return {"success": True, "message": None, "data": data}
+
+    detail = resp
+    try:
+        detail = json.loads(resp).get("message", resp)
+    except Exception:
+        pass
+    return err(502, f"ClearMechanic rechazó el punto de inspección (HTTP {status}): {detail}")
+
+
+@router.patch(
+    "/orders/{folio}/inspection/{item_id}",
+    summary="Edita un punto de inspección (inspectionItem) en ClearMechanic",
+)
+def patch_inspection_item(
+    folio:          str,
+    item_id:        int,
+    repairShopId:   int           = Body(..., embed=True),
+    name:           Optional[str] = Body(default=None, embed=True),
+    priority:       Optional[str] = Body(default=None, embed=True),
+    approvalStatus: Optional[str] = Body(default=None, embed=True),
+    comments:       Optional[str] = Body(default=None, embed=True),
+):
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado.")
+    guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
+    if not guid:
+        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+    if priority is not None and priority not in _PRIORITY_VALUES:
+        return err(400, f"priority inválido '{priority}'. Usa: Low | Med | Urgent.")
+
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+
+    body: dict = {}
+    if name is not None:           body["inspectionItemName"] = str(name)
+    if priority is not None:       body["priority"] = priority
+    if approvalStatus is not None: body["approvalStatus"] = approvalStatus
+    if comments is not None:       body["comments"] = [str(comments)]
+    if not body:
+        return err(400, "No hay cambios que actualizar.")
+
+    url = f"{CM_ORDERS_URL}/{urllib.parse.quote(str(folio))}/inspectionItems/{int(item_id)}?workshopId={guid}"
+    status, resp = _http_patch_json(url, body, {"Authorization": f"Bearer {token}"})
+    if status in (200, 201, 204):
+        return {"success": True, "message": None}
+
+    detail = resp
+    try:
+        detail = json.loads(resp).get("message", resp)
+    except Exception:
+        pass
+    return err(502, f"ClearMechanic rechazó la edición (HTTP {status}): {detail}")
