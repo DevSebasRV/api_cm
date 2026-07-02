@@ -1148,6 +1148,67 @@ def quote_article_search(
 
 
 @router.get(
+    "/kitSearch",
+    summary="Busca KITS (artículos con Lista de Materiales / BOM) para armar ofertas",
+)
+def kit_search(
+    keyword:  str           = Query(..., min_length=2, description="Texto: busca en ItemCode e ItemName del kit"),
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Igual que quoteArticleSearch pero SOLO artículos que son cabecera de una
+    Lista de Materiales (kit): OITT.Code con TreeType 'S' (Venta) o 'T' (Modelo).
+    Devuelve hasta 25 con su precio de lista PRICE_LIST_CODE (ITM1). El precio es
+    editable en el portal; SAP explota el BOM al crear la oferta.
+    """
+    _, database = resolve_db(x_sap_db)
+    words = [w for w in keyword.strip().split() if w]
+    if not words:
+        return {"success": True, "kits": []}
+
+    clause = " AND ".join("(OITM.ItemCode LIKE ? OR OITM.ItemName LIKE ?)" for _ in words)
+    params: list = [PRICE_LIST_CODE]
+    for w in words:
+        like = f"%{w}%"
+        params += [like, like]
+
+    sql = f"""
+        SELECT TOP 25
+            OITM.ItemCode,
+            OITM.ItemName,
+            OITT.TreeType,
+            ISNULL(ITM1.Price, 0) AS Price
+        FROM   OITT
+        JOIN   OITM ON OITM.ItemCode = OITT.Code
+        LEFT   JOIN ITM1 ON ITM1.ItemCode = OITM.ItemCode AND ITM1.PriceList = ?
+        WHERE  OITT.TreeType IN ('S', 'T')
+          AND  ISNULL(OITM.Canceled,'N') = 'N'
+          AND  {clause}
+        ORDER BY OITM.ItemCode
+    """
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(sql, params)
+            kits = [
+                {
+                    "ItemCode": r.ItemCode,
+                    "ItemName": r.ItemName,
+                    "TreeType": r.TreeType,     # 'S' Venta | 'T' Modelo
+                    "Price":    float(r.Price) if r.Price is not None else 0.0,
+                }
+                for r in cursor.fetchall()
+            ]
+        finally:
+            cursor.close()
+            conn.close()
+        return {"success": True, "kits": kits}
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+
+
+@router.get(
     "/salespersonSearch",
     summary="Busca vendedores (OSLP) con su almacén asignado, para crear ofertas",
 )
