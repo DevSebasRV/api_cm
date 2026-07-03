@@ -1152,44 +1152,71 @@ def quote_article_search(
     summary="Busca KITS (artículos con Lista de Materiales / BOM) para armar ofertas",
 )
 def kit_search(
-    keyword:  str           = Query(..., min_length=2, description="Texto: busca en ItemCode e ItemName del kit"),
+    keyword:  Optional[str] = Query(default=None, description="Texto: busca en ItemCode e ItemName del kit"),
+    callId:   Optional[int] = Query(default=None, description="ODS: filtra kits por la moto de la orden (marca/submarca)"),
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
 ):
     """
-    Igual que quoteArticleSearch pero SOLO artículos que son cabecera de una
-    Lista de Materiales (kit): OITT.Code con TreeType 'S' (Venta) o 'T' (Modelo).
-    Devuelve hasta 25 con su precio de lista PRICE_LIST_CODE (ITM1). El precio es
+    Kits = artículos cabecera de una Lista de Materiales (OITT.Code, TreeType 'S'
+    Venta / 'T' Modelo), con precio de lista PRICE_LIST_CODE (ITM1).
+
+    Si viene `callId`, filtra los kits por la MOTO de la orden: se leen marca y
+    submarca del ARTÍCULO de la moto (OSCL → OINS → itemCode → OITM.U_TIPO_MARCA /
+    U_SUBMARCA, porque los UDFs de la tarjeta OINS suelen estar vacíos) y se
+    devuelven solo los kits cuyos U_TIPO_MARCA/U_SUBMARCA coinciden. El precio es
     editable en el portal; SAP explota el BOM al crear la oferta.
     """
     _, database = resolve_db(x_sap_db)
-    words = [w for w in keyword.strip().split() if w]
-    if not words:
-        return {"success": True, "kits": []}
+    words = [w for w in (keyword or "").strip().split() if w]
 
-    clause = " AND ".join("(OITM.ItemCode LIKE ? OR OITM.ItemName LIKE ?)" for _ in words)
-    params: list = [PRICE_LIST_CODE]
-    for w in words:
-        like = f"%{w}%"
-        params += [like, like]
-
-    sql = f"""
-        SELECT TOP 25
-            OITM.ItemCode,
-            OITM.ItemName,
-            OITT.TreeType,
-            ISNULL(ITM1.Price, 0) AS Price
-        FROM   OITT
-        JOIN   OITM ON OITM.ItemCode = OITT.Code
-        LEFT   JOIN ITM1 ON ITM1.ItemCode = OITM.ItemCode AND ITM1.PriceList = ?
-        WHERE  OITT.TreeType IN ('S', 'T')
-          AND  ISNULL(OITM.Canceled,'N') = 'N'
-          AND  {clause}
-        ORDER BY OITM.ItemCode
-    """
     try:
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
+            # Marca/submarca de la moto de la ODS (del artículo de la moto).
+            moto_marca = moto_sub = None
+            if callId:
+                cursor.execute(
+                    """
+                    SELECT LTRIM(RTRIM(M.U_TIPO_MARCA)) AS marca,
+                           LTRIM(RTRIM(M.U_SUBMARCA))   AS sub
+                    FROM   OSCL O
+                    LEFT   JOIN OINS I ON I.insID = O.insID
+                    LEFT   JOIN OITM M ON M.ItemCode = ISNULL(I.itemCode, O.itemCode)
+                    WHERE  O.callID = ?
+                    """,
+                    [callId],
+                )
+                mr = cursor.fetchone()
+                if mr:
+                    moto_marca = mr.marca or None
+                    moto_sub   = mr.sub or None
+
+            # Debe haber por qué filtrar: texto o (marca+submarca de la moto).
+            if not words and not (moto_marca and moto_sub):
+                return {"success": True, "kits": [], "motoMarca": moto_marca, "motoSubMarca": moto_sub}
+
+            conds  = ["OITT.TreeType IN ('S', 'T')", "ISNULL(OITM.Canceled,'N') = 'N'"]
+            params: list = [PRICE_LIST_CODE]
+            for w in words:
+                conds.append("(OITM.ItemCode LIKE ? OR OITM.ItemName LIKE ?)")
+                like = f"%{w}%"
+                params += [like, like]
+            if moto_marca and moto_sub:
+                conds.append("LTRIM(RTRIM(ISNULL(OITM.U_TIPO_MARCA,''))) = ?")
+                conds.append("LTRIM(RTRIM(ISNULL(OITM.U_SUBMARCA,'')))   = ?")
+                params += [moto_marca, moto_sub]
+
+            sql = f"""
+                SELECT TOP 25
+                    OITM.ItemCode, OITM.ItemName, OITT.TreeType,
+                    ISNULL(ITM1.Price, 0) AS Price
+                FROM   OITT
+                JOIN   OITM ON OITM.ItemCode = OITT.Code
+                LEFT   JOIN ITM1 ON ITM1.ItemCode = OITM.ItemCode AND ITM1.PriceList = ?
+                WHERE  {' AND '.join(conds)}
+                ORDER BY OITM.ItemCode
+            """
             cursor.execute(sql, params)
             kits = [
                 {
@@ -1203,7 +1230,7 @@ def kit_search(
         finally:
             cursor.close()
             conn.close()
-        return {"success": True, "kits": kits}
+        return {"success": True, "kits": kits, "motoMarca": moto_marca, "motoSubMarca": moto_sub}
     except pyodbc.Error as db_err:
         return err(500, f"Error de SAP B1: {db_err}")
 
