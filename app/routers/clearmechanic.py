@@ -371,22 +371,37 @@ def get_cm_inspection(folio: str, repairShopId: int):
     except Exception:
         return err(502, "Respuesta inválida de ClearMechanic.")
 
+    def _num(x):
+        try:
+            return float(x) if x is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     items = []
     for it in (data.get("inspectionItems") or []):
         if not isinstance(it, dict):
             continue
+        parts  = it.get("parts")  or []
+        labors = it.get("labors") or []
+        # Total del punto = suma de sus estimates (parts + labors): qty × precio.
+        total = _num(it.get("quantity")) * _num(it.get("partUnitPrice"))
+        total += _num(it.get("laborHours")) * _num(it.get("laborHourPrice"))
+        for p in parts:
+            if isinstance(p, dict):
+                total += _num(p.get("quantity") or 1) * _num(p.get("partUnitPrice"))
+                total += _num(p.get("laborHours")) * _num(p.get("laborHourPrice"))
+        for l in labors:
+            if isinstance(l, dict):
+                total += _num(l.get("laborHours") or l.get("quantity") or 1) * _num(l.get("laborHourPrice"))
         items.append({
             "id":             it.get("cmosInspectionItemId"),
             "name":           it.get("inspectionItemName"),
             "priority":       it.get("priority"),          # Low | Med | Urgent → color en el front
             "approvalStatus": it.get("approvalStatus"),    # Pending | Approved | Rejected
             "comments":       it.get("comments") or it.get("inspectionItemComments") or "",
-            "quantity":       it.get("quantity"),
-            "partUnitPrice":  it.get("partUnitPrice"),
-            "laborHours":     it.get("laborHours"),
-            "laborHourPrice": it.get("laborHourPrice"),
-            "parts":          it.get("parts") or [],
-            "labors":         it.get("labors") or [],
+            "total":          round(total, 2),             # suma de los artículos del punto
+            "parts":          parts,
+            "labors":         labors,
         })
 
     return {
