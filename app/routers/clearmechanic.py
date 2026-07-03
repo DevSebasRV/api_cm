@@ -377,12 +377,34 @@ def get_cm_inspection(folio: str, repairShopId: int):
         except (TypeError, ValueError):
             return 0.0
 
+    def _line(d, is_labor=False):
+        """Normaliza un estimate (part o labor) de CM a {sku,name,quantity,unitPrice,total}.
+        El SKU confiable es `partNumber` (el `partId` a veces viene null)."""
+        sku  = (d.get("partNumber") or d.get("partId") or "") or ""
+        name = d.get("partName") or d.get("laborName") or ""
+        if is_labor:
+            qty   = _num(d.get("laborHours") or d.get("quantity") or 1)
+            price = _num(d.get("laborHourPrice") or d.get("partUnitPrice"))
+        else:
+            qty   = _num(d.get("quantity") or 1)
+            price = _num(d.get("partUnitPrice"))
+        return {
+            "sku":       str(sku),
+            "name":      name,
+            "quantity":  qty,
+            "unitPrice": round(price, 2),
+            "total":     round(qty * price, 2),
+        }
+
     items = []
     for it in (data.get("inspectionItems") or []):
         if not isinstance(it, dict):
             continue
         parts  = it.get("parts")  or []
         labors = it.get("labors") or []
+        # Líneas normalizadas (para el desglose por sección en el portal).
+        lines = [_line(p, False) for p in parts  if isinstance(p, dict)]
+        lines += [_line(l, True)  for l in labors if isinstance(l, dict)]
         # Total del punto = suma de sus estimates (parts + labors): qty × precio.
         total = _num(it.get("quantity")) * _num(it.get("partUnitPrice"))
         total += _num(it.get("laborHours")) * _num(it.get("laborHourPrice"))
@@ -400,6 +422,7 @@ def get_cm_inspection(folio: str, repairShopId: int):
             "approvalStatus": it.get("approvalStatus"),    # Pending | Approved | Rejected
             "comments":       it.get("comments") or it.get("inspectionItemComments") or "",
             "total":          round(total, 2),             # suma de los artículos del punto
+            "lines":          lines,                       # [{sku,name,quantity,unitPrice,total}]
             "parts":          parts,
             "labors":         labors,
         })
