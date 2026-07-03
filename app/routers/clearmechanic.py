@@ -535,3 +535,54 @@ def patch_inspection_item(
     except Exception:
         pass
     return err(502, f"ClearMechanic rechazó la edición (HTTP {status}): {detail}")
+
+
+@router.post(
+    "/orders/{folio}/inspection/{item_id}/estimates",
+    summary="Agrega artículos (estimates) a un punto de inspección existente en CM",
+)
+def add_inspection_estimates(
+    folio:        str,
+    item_id:      int,
+    repairShopId: int  = Body(..., embed=True),
+    estimates:    list = Body(default=[], embed=True, description="Artículos/kits {itemCode,name,quantity,unitPrice}"),
+):
+    """Empuja los artículos de una oferta a un punto de inspección que YA existe en CM.
+    CM sólo acepta un estimate por llamada (postInspectionItemEstimate), así que
+    iteramos: 1 POST por artículo. Se usa al 'Cotizar' un punto traído de CM."""
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado.")
+    guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
+    if not guid:
+        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+
+    items = _estimates_for_cm(estimates)
+    if not items:
+        return err(400, "No hay artículos que agregar al punto de inspección.")
+
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+
+    base_url = (
+        f"{CM_ORDERS_URL}/{urllib.parse.quote(str(folio))}"
+        f"/inspectionItems/{int(item_id)}/estimates?workshopId={guid}"
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+    added = 0
+    errors: list = []
+    for e in items:
+        status, resp = _http_post_json(base_url, e, headers)
+        if status in (200, 201):
+            added += 1
+        else:
+            detail = resp
+            try:
+                detail = json.loads(resp).get("message", resp)
+            except Exception:
+                pass
+            errors.append(f"{e.get('estimateName') or e.get('partId')}: HTTP {status} {detail}")
+
+    if added == 0:
+        return err(502, "ClearMechanic rechazó los artículos: " + " | ".join(errors[:3]))
+    return {"success": True, "message": None, "added": added, "errors": errors}
