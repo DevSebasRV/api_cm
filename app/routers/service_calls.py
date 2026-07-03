@@ -1236,6 +1236,54 @@ def kit_search(
 
 
 @router.get(
+    "/kitComponents",
+    summary="Componentes (artículos) de un kit / Lista de Materiales (ITT1)",
+)
+def kit_components(
+    itemCode: str           = Query(..., min_length=1, description="Código del kit (cabecera del BOM)"),
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Devuelve los componentes de la Lista de Materiales del kit (ITT1.Father),
+    con su cantidad y precio. El precio es el del BOM (ITT1.Price); si es 0 usa
+    el de lista PRICE_LIST_CODE (ITM1). Se usan estos artículos en la oferta y en
+    los estimates del punto de inspección — NO el kit como tal.
+    """
+    _, database = resolve_db(x_sap_db)
+    sql = """
+        SELECT C.Code, C.Quantity, C.Price AS BomPrice, C.Warehouse,
+               O.ItemName, ISNULL(I.Price, 0) AS ListPrice
+        FROM   ITT1 C
+        LEFT   JOIN OITM O ON O.ItemCode = C.Code
+        LEFT   JOIN ITM1 I ON I.ItemCode = C.Code AND I.PriceList = ?
+        WHERE  C.Father = ?
+        ORDER BY C.ChildNum
+    """
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(sql, [PRICE_LIST_CODE, itemCode])
+            components = []
+            for r in cursor.fetchall():
+                bom  = float(r.BomPrice)  if r.BomPrice  is not None else 0.0
+                lst  = float(r.ListPrice) if r.ListPrice is not None else 0.0
+                components.append({
+                    "ItemCode":  r.Code,
+                    "ItemName":  r.ItemName,
+                    "Quantity":  float(r.Quantity) if r.Quantity is not None else 1.0,
+                    "Price":     bom if bom > 0 else lst,
+                    "Warehouse": r.Warehouse,
+                })
+        finally:
+            cursor.close()
+            conn.close()
+        return {"success": True, "itemCode": itemCode, "components": components}
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+
+
+@router.get(
     "/salespersonSearch",
     summary="Busca vendedores (OSLP) con su almacén asignado, para crear ofertas",
 )
