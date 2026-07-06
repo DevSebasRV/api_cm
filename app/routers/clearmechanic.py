@@ -59,6 +59,10 @@ _WORKSHOP_GUID_BY_SHOP = {
 # Color del portal → priority de CM. Rojo=Urgent, Amarillo=Med, Verde=Low.
 _PRIORITY_VALUES = {"Low", "Med", "Urgent"}
 
+# Base del API de CM (".../api/cm"), derivada de CM_ORDERS_URL para respetar el
+# override del .env. De aquí cuelgan appointments, v2/appointments, users, etc.
+CM_API_BASE = CM_ORDERS_URL.rsplit("/orders", 1)[0]
+
 
 def _resolve_phase(repair_shop_id: int, status_raw: str) -> Optional[str]:
     """phaseId de CM para (taller, status SAP).
@@ -609,3 +613,308 @@ def add_inspection_estimates(
     if added == 0:
         return err(502, "ClearMechanic rechazó los artículos: " + " | ".join(errors[:3]))
     return {"success": True, "message": None, "added": added, "errors": errors}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CITAS (appointments) de ClearMechanic
+#   - GET  /appointments        → lista citas del taller (por rango de fecha)
+#   - POST /appointments        → crea una cita (API v2: cliente + vehículo inline)
+#   - GET  /serviceAdvisors     → asesores del taller (para el selector del form)
+# El workshopId (GUID) se resuelve del repairShopId numérico, igual que inspección.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _appointment_view(a: dict) -> dict:
+    """Curado de los campos útiles de una cita de CM para el portal."""
+    return {
+        "appointmentNumber": a.get("appointmentNumber"),
+        "status":            a.get("status"),
+        "startDate":         a.get("startDate"),
+        "deliveryDate":      a.get("deliveryDate"),
+        "duration":          a.get("duration"),
+        "customerId":        a.get("customerId"),
+        "firstName":         a.get("firstName"),
+        "lastName":          a.get("lastName"),
+        "email":             a.get("email"),
+        "mobile":            a.get("mobile"),
+        "vehicleId":         a.get("vehicleId"),
+        "brand":             a.get("brand"),
+        "model":             a.get("model"),
+        "year":              a.get("year"),
+        "vin":               a.get("vin"),
+        "licensePlate":      a.get("licensePlate"),
+        "color":             a.get("color"),
+        "serviceAdvisor":    a.get("serviceAdvisor"),
+        "serviceAdvisorId":  a.get("serviceAdvisorId"),
+        "observations":      a.get("observations") or "",
+        "orderNumber":       a.get("orderNumber") or "",
+        "creationSource":    a.get("creationSource"),
+    }
+
+
+@router.get(
+    "/appointments",
+    summary="Lista las citas (appointments) de un taller en ClearMechanic",
+)
+def list_cm_appointments(
+    repairShopId: int,
+    dateFrom:     str,
+    dateTo:       Optional[str] = None,
+    status:       Optional[str] = None,
+    vin:          Optional[str] = None,
+    licensePlate: Optional[str] = None,
+    page:         int = 1,
+    pageSize:     int = 50,
+):
+    """GET /cm/appointments?workshopId=<GUID>&dateFrom=&dateTo=… (dateFrom obligatorio)."""
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado.")
+    guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
+    if not guid:
+        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+    if not dateFrom:
+        return err(400, "dateFrom es obligatorio (formato YYYY-MM-DD).")
+
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+
+    params = {"workshopId": guid, "dateFrom": dateFrom, "page": page, "pageSize": pageSize}
+    if dateTo:       params["dateTo"] = dateTo
+    if status:       params["status"] = status
+    if vin:          params["vin"] = vin
+    if licensePlate: params["licensePlate"] = licensePlate
+
+    url = f"{CM_API_BASE}/appointments?{urllib.parse.urlencode(params)}"
+    st, body = _http_get_json(url, {"Authorization": f"Bearer {token}"})
+    if st not in (200, 201):
+        detail = body
+        try:
+            detail = json.loads(body).get("message", body)
+        except Exception:
+            pass
+        return err(502, f"ClearMechanic rechazó la consulta de citas (HTTP {st}): {detail}")
+
+    try:
+        data = json.loads(body).get("data", {}) or {}
+    except Exception:
+        return err(502, "Respuesta inválida de ClearMechanic (citas).")
+
+    raw = data.get("appointments") or data.get("data") or []
+    appts = [_appointment_view(a) for a in raw if isinstance(a, dict)]
+    return {
+        "success": True, "message": None,
+        "data": {
+            "page":         data.get("page", page),
+            "pageSize":     data.get("pageSize", pageSize),
+            "total":        data.get("totalNumberOfRecords", len(appts)),
+            "appointments": appts,
+        },
+    }
+
+
+@router.post(
+    "/appointments",
+    summary="Crea una cita (appointment) en ClearMechanic vía API v2",
+)
+def create_cm_appointment(
+    repairShopId:     int           = Body(..., embed=True),
+    startDate:        str           = Body(..., embed=True, description="ISO 8601, ej. 2026-07-10T15:30:00Z"),
+    customer:         dict          = Body(..., embed=True, description="{firstName, mobile, lastName?, email?}"),
+    vehicle:          dict          = Body(default={}, embed=True, description="{brand,model,year,vin,licensePlate,color}"),
+    customReasons:    list          = Body(default=[], embed=True,
+                                           description="[{customReasonId, customReasonDetailId?}] — Roma exige al menos uno"),
+    duration:         Optional[int] = Body(default=None, embed=True, description="Minutos"),
+    observations:     Optional[str] = Body(default=None, embed=True),
+    serviceAdvisorId: Optional[str] = Body(default=None, embed=True),
+    sendReminder:     bool          = Body(default=False, embed=True),
+    orderNumber:      Optional[str] = Body(default=None, embed=True,
+                                           description="ODS SAP; V2 no liga por campo, se estampa en observations"),
+):
+    """POST /cm/v2/appointments?workshopId=<GUID>. V2 acepta cliente y vehículo
+    inline (no hay que pre-crear customer/vehicle). serviceAdvisorId y motivos son
+    opcionales. Si viene orderNumber se estampa como 'ODS #<n>' en observations
+    (V2 no tiene campo orderNumber para ligar a la orden SAP)."""
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado.")
+    guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
+    if not guid:
+        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+
+    cust = customer or {}
+    first  = (cust.get("firstName") or "").strip()
+    mobile = (cust.get("mobile") or "").strip()
+    if not first or not mobile:
+        return err(400, "La cita requiere al menos el nombre y el celular del cliente.")
+    if not startDate:
+        return err(400, "startDate es obligatorio (ISO 8601).")
+
+    # El vehículo necesita VIN o (placa + marca + modelo). Lo valida también CM,
+    # pero avisamos claro antes de gastar el POST.
+    veh = vehicle or {}
+    _vin = str(veh.get("vin") or "").strip()
+    _plate, _brand, _model = (str(veh.get(k) or "").strip() for k in ("licensePlate", "brand", "model"))
+    if not _vin and not (_plate and _brand and _model):
+        return err(400, "El vehículo requiere VIN, o bien placa + marca + modelo.")
+
+    # customReasons: CM (Roma) exige al menos un motivo. Normalizamos al formato
+    # PLANO que espera el POST: {customReasonId, customReasonDetailId?}.
+    reasons = []
+    for r in (customReasons or []):
+        if not isinstance(r, dict):
+            continue
+        rid = r.get("customReasonId") or r.get("reasonId")
+        if not rid:
+            continue
+        entry = {"customReasonId": str(rid)}
+        did = r.get("customReasonDetailId") or r.get("detailId")
+        if did:
+            entry["customReasonDetailId"] = str(did)
+        reasons.append(entry)
+    if not reasons:
+        return err(400, "La cita requiere al menos un motivo (customReasons).")
+
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+
+    obs = (observations or "").strip()
+    if orderNumber:
+        tag = f"ODS #{str(orderNumber).strip()}"
+        obs = f"{obs} · {tag}" if obs else tag
+
+    payload = {
+        "customer": {
+            "firstName": first,
+            "lastName":  str(cust.get("lastName") or ""),
+            "mobile":    mobile,
+            "email":     str(cust.get("email") or ""),
+        },
+        "vehicle": {
+            "vin":          _vin,
+            "licensePlate": _plate,
+            "brand":        _brand,
+            "model":        _model,
+            "year":         str(veh.get("year") or ""),
+            "color":        str(veh.get("color") or ""),
+        },
+        "startDate":     str(startDate),
+        "sendReminder":  bool(sendReminder),
+        "customReasons": reasons,
+    }
+    if duration:
+        payload["duration"] = int(duration)
+    if obs:
+        payload["observations"] = obs
+    if serviceAdvisorId:
+        payload["serviceAdvisorId"]  = str(serviceAdvisorId)
+        payload["userWhoScheduleId"] = str(serviceAdvisorId)
+
+    url = f"{CM_API_BASE}/v2/appointments?workshopId={guid}"
+    st, resp = _http_post_json(url, payload, {"Authorization": f"Bearer {token}"})
+    if st in (200, 201):
+        data = None
+        try:
+            data = json.loads(resp).get("data")
+        except Exception:
+            pass
+        return {"success": True, "message": None, "data": data}
+
+    detail = resp
+    try:
+        detail = json.loads(resp).get("message", resp)
+    except Exception:
+        pass
+    return err(502, f"ClearMechanic rechazó la cita (HTTP {st}): {detail}", {"sentPayload": payload})
+
+
+@router.get(
+    "/serviceAdvisors",
+    summary="Asesores de servicio (users role ServiceAdvisor) de un taller",
+)
+def list_cm_service_advisors(repairShopId: int):
+    """GET /cm/users?workshopId=<GUID>&role=ServiceAdvisor. Para el selector de asesor."""
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado.")
+    guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
+    if not guid:
+        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+
+    params = {"workshopId": guid, "role": "ServiceAdvisor", "pageSize": 200}
+    url = f"{CM_API_BASE}/users?{urllib.parse.urlencode(params)}"
+    st, body = _http_get_json(url, {"Authorization": f"Bearer {token}"})
+    if st not in (200, 201):
+        detail = body
+        try:
+            detail = json.loads(body).get("message", body)
+        except Exception:
+            pass
+        return err(502, f"ClearMechanic rechazó la consulta de asesores (HTTP {st}): {detail}")
+
+    try:
+        data = json.loads(body).get("data", {}) or {}
+    except Exception:
+        return err(502, "Respuesta inválida de ClearMechanic (asesores).")
+
+    raw = data.get("data") or data.get("users") or []
+    advisors = [{
+        "userId":   u.get("userId"),
+        "userName": u.get("userName"),
+        "email":    u.get("email"),
+        "isActive": u.get("isActive"),
+    } for u in raw if isinstance(u, dict) and u.get("userId")]
+    return {"success": True, "message": None, "data": {"advisors": advisors}}
+
+
+@router.get(
+    "/customReasons",
+    summary="Catálogo de motivos de cita (customReasons) de un taller",
+)
+def list_cm_custom_reasons(repairShopId: int):
+    """GET /cm/customReasons?workshopId=<GUID>. Motivos con sus detalles, para el
+    selector del formulario de cita. Roma exige elegir al menos uno al crear."""
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado.")
+    guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
+    if not guid:
+        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+
+    url = f"{CM_API_BASE}/customReasons?workshopId={guid}"
+    st, body = _http_get_json(url, {"Authorization": f"Bearer {token}"})
+    if st not in (200, 201):
+        detail = body
+        try:
+            detail = json.loads(body).get("message", body)
+        except Exception:
+            pass
+        return err(502, f"ClearMechanic rechazó la consulta de motivos (HTTP {st}): {detail}")
+
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        return err(502, "Respuesta inválida de ClearMechanic (motivos).")
+
+    # /cm/customReasons devuelve la lista directamente en `data` (no anidada).
+    raw = parsed.get("data") if isinstance(parsed, dict) else parsed
+    if not isinstance(raw, list):
+        raw = (raw or {}).get("data") if isinstance(raw, dict) else []
+    reasons = []
+    for r in (raw or []):
+        if not isinstance(r, dict):
+            continue
+        reasons.append({
+            "reasonId":    r.get("reasonId"),
+            "description": r.get("description"),
+            "details": [
+                {"detailId": d.get("detailId"), "description": d.get("description")}
+                for d in (r.get("details") or []) if isinstance(d, dict)
+            ],
+        })
+    return {"success": True, "message": None, "data": {"reasons": reasons}}
