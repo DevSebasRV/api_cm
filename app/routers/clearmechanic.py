@@ -821,9 +821,16 @@ def create_cm_appointment(
 
     detail = resp
     try:
-        detail = json.loads(resp).get("message", resp)
+        parsed = json.loads(resp)
+        detail = parsed.get("message") or (parsed.get("data") or {}).get("message") or resp
     except Exception:
         pass
+    # 409: CM no encontró asesor disponible para ese horario (fin de semana, fuera
+    # de 9-18, o todos ocupados). Elegir asesor explícito NO lo evita (CM valida la
+    # agenda igual). Damos un mensaje accionable.
+    if st == 409 or "No available service advisor" in str(detail):
+        return err(409, "No hay asesor disponible en ese horario. Los asesores atienden "
+                        "de lunes a viernes, 9:00 a 18:00. Elige otra fecha y hora.")
     return err(502, f"ClearMechanic rechazó la cita (HTTP {st}): {detail}", {"sentPayload": payload})
 
 
