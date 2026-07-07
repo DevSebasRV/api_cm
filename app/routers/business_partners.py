@@ -20,7 +20,8 @@ _SELECT = """
             Phone1,
             Cellular,
             CardType,
-            Balance
+            Balance,
+            E_Mail
     FROM    OCRD
 """
 
@@ -34,6 +35,7 @@ def build_bp(row) -> dict:
         "Cellular":              row[4],
         "CardType":              _TYPE_MAP.get(row[5], row[5]),
         "CurrentAccountBalance": float(row[6]) if row[6] is not None else 0.0,
+        "EmailAddress":          row[7],
     }
 
 

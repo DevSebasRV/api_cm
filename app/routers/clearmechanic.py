@@ -337,6 +337,122 @@ def create_cm_order(
     )
 
 
+def _cm_phases(guid: str, token: str) -> list:
+    """Fases del taller en CM: [{phaseId, name}]. Lista corta; sin cache."""
+    st, body = _http_get_json(
+        f"{CM_API_BASE}/phases?workshopId={guid}",
+        {"Authorization": f"Bearer {token}"},
+    )
+    if st != 200:
+        return []
+    try:
+        data = json.loads(body)
+        return data.get("data") or (data if isinstance(data, list) else [])
+    except Exception:
+        return []
+
+
+def _norm_phase(s: str) -> str:
+    """Normaliza para matchear estatus SAP ↔ fase CM: minúsculas, sin acentos,
+    sin prefijo 'NN-', ' x ' → ' por ', solo alfanumérico."""
+    s = (s or "").strip().lower()
+    s = re.sub(r"^\d+\s*[-.]?\s*", "", s)          # quita prefijo "02-"
+    for a, b in [("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),("ñ","n")]:
+        s = s.replace(a, b)
+    s = re.sub(r"\bx\b", "por", s)                  # "transito x refacc" → "por"
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
+def _match_phase(status_name: str, phases: list) -> Optional[int]:
+    """Fase CM cuyo nombre matchea el estatus SAP (igual o por prefijo — los
+    nombres de OSCS vienen truncados a ~20 chars). None si no hay match."""
+    target = _norm_phase(status_name)
+    if not target:
+        return None
+    for p in phases:
+        pid, name = p.get("phaseId"), _norm_phase(p.get("name") or "")
+        if not name or pid is None or int(pid) < 0:
+            continue
+        if name == target or name.startswith(target) or target.startswith(name):
+            return int(pid)
+    return None
+
+
+@router.get(
+    "/phases",
+    summary="Fases (phases) del taller en ClearMechanic",
+)
+def list_cm_phases(repairShopId: int):
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado.")
+    guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
+    if not guid:
+        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+    return {"success": True, "message": None, "data": {"phases": _cm_phases(guid, token)}}
+
+
+@router.patch(
+    "/orders/{folio}",
+    summary="Actualiza una orden en ClearMechanic (teléfono, correo y/o fase)",
+)
+def patch_cm_order(
+    folio:        str,
+    repairShopId: int           = Body(..., embed=True),
+    mobile:       Optional[str] = Body(default=None, embed=True),
+    email:        Optional[str] = Body(default=None, embed=True),
+    statusName:   Optional[str] = Body(default=None, embed=True,
+                                       description="Nombre del estatus SAP; se matchea a la fase CM por nombre"),
+):
+    """PATCH /cm/v2/orders/{folio} con los campos dados. La fase se resuelve
+    matcheando el NOMBRE del estatus SAP contra las fases del taller (el cliente
+    nombró sus estatus como las fases de CM, ej. '02-Esperando Rampa'). Si el
+    estatus no matchea ninguna fase, se actualizan los demás campos y se avisa."""
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado.")
+    guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
+    if not guid:
+        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+
+    body: dict = {"orderNumber": str(folio)}
+    phase_warning = None
+    if mobile is not None and str(mobile).strip():
+        body["mobile"] = str(mobile).strip()
+    if email is not None:
+        body["email"] = str(email).strip()
+    if statusName:
+        pid = _match_phase(statusName, _cm_phases(guid, token))
+        if pid is not None:
+            body["phase"] = pid
+        else:
+            phase_warning = (f"El estatus '{statusName}' no corresponde a ninguna fase "
+                             f"de ClearMechanic; la fase no se cambió.")
+
+    if len(body) == 1:  # solo orderNumber
+        return {"success": True, "message": None, "data": {"updated": False, "warning": phase_warning}}
+
+    url = f"{CM_API_BASE}/v2/orders/{urllib.parse.quote(str(folio))}?workshopId={guid}"
+    st, resp = _http_patch_json(url, body, {"Authorization": f"Bearer {token}"})
+    if st in (200, 201, 204):
+        return {"success": True, "message": None,
+                "data": {"updated": True, "warning": phase_warning,
+                         "sentFields": [k for k in body if k != "orderNumber"]}}
+
+    detail = resp
+    try:
+        j = json.loads(resp)
+        detail = j.get("message") or (j.get("data") or {}).get("message") or resp
+    except Exception:
+        pass
+    return err(502, f"ClearMechanic no aceptó la actualización: {detail}")
+
+
 @router.get(
     "/orders/{folio}/inspection",
     summary="Puntos de inspección (inspectionItems) de una orden en ClearMechanic",

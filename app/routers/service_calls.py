@@ -94,12 +94,17 @@ _LIST_SELECT = """
             OSCL.createDate,
             OSCL.createTime,
             OSCL.closeDate,
-            OHEM.firstName + ISNULL(' ' + OHEM.lastName, '') AS Tecnico
+            OHEM.firstName + ISNULL(' ' + OHEM.lastName, '') AS Tecnico,
+            OINS.U_Ps_Marca     AS MotoMarca,
+            OINS.U_Ps_SubMarca  AS MotoSubMarca,
+            OINS.U_Ps_Modelo    AS MotoModelo,
+            OINS.U_Ps_Placa     AS MotoPlaca
     FROM    OSCL
     LEFT    JOIN OCRD ON OCRD.CardCode  = OSCL.customer
     LEFT    JOIN OITM ON OITM.ItemCode  = OSCL.itemCode
     LEFT    JOIN OSCS ON OSCS.statusID  = OSCL.status
     LEFT    JOIN OHEM ON OHEM.empID     = OSCL.assignee
+    LEFT    JOIN OINS ON OINS.insID     = OSCL.insID
 """
 
 
@@ -121,6 +126,12 @@ def _build_list_row(r) -> Dict[str, Any]:
         "CreateTime":    int(r.createTime) if r.createTime is not None else None,
         "CloseDate":     r.closeDate.isoformat() if r.closeDate else None,
         "Tecnico":       (r.Tecnico or "").strip() or None,
+        # Datos de la moto según la TARJETA DE EQUIPO (OINS vía OSCL.insID).
+        # U_Ps_Modelo guarda el AÑO (así lo usa el cliente: "Modelo (Año)").
+        "MotoMarca":     (r.MotoMarca or "").strip() or None,
+        "MotoSubMarca":  (r.MotoSubMarca or "").strip() or None,
+        "MotoModelo":    str(r.MotoModelo) if r.MotoModelo is not None else None,
+        "MotoPlaca":     (r.MotoPlaca or "").strip() or None,
     }
 
 
@@ -150,20 +161,40 @@ def list_service_calls(
     if keyword:
         words = keyword.split()
         for w in words:
-            where_parts.append(
-                "(OSCL.subject LIKE ? OR OSCL.custmrName LIKE ? "
-                "OR OSCL.itemCode LIKE ? OR OSCL.itemName LIKE ?)"
-            )
             like = f"%{w}%"
-            params += [like, like, like, like]
+            # Búsqueda libre: asunto, cliente (nombre en la ODS y nombre actual en
+            # OCRD), SKU/descripción del artículo y PLACA de la tarjeta de equipo.
+            # Si la palabra es numérica también matchea el número de ODS (CallID) —
+            # sin esto, buscar "82095" no encontraba la orden ("fallas al localizar
+            # registros en páginas distintas").
+            clause = (
+                "(OSCL.subject LIKE ? OR OSCL.custmrName LIKE ? "
+                "OR OCRD.CardName LIKE ? "
+                "OR OSCL.itemCode LIKE ? OR OSCL.itemName LIKE ? "
+                "OR OINS.U_Ps_Placa LIKE ?"
+            )
+            params_w = [like, like, like, like, like, like]
+            if w.isdigit():
+                clause += " OR OSCL.callID = ? OR CAST(OSCL.callID AS VARCHAR(20)) LIKE ?"
+                params_w += [int(w), like]
+            clause += ")"
+            where_parts.append(clause)
+            params += params_w
 
     where_clause = " AND ".join(where_parts)
+
+    # El WHERE ahora referencia OCRD/OINS, así que el COUNT usa los mismos JOINs.
+    _COUNT_FROM = """
+        FROM    OSCL
+        LEFT    JOIN OCRD ON OCRD.CardCode  = OSCL.customer
+        LEFT    JOIN OINS ON OINS.insID     = OSCL.insID
+    """
 
     try:
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
-            cursor.execute(f"SELECT COUNT(*) FROM OSCL WHERE {where_clause}", params)
+            cursor.execute(f"SELECT COUNT(*) {_COUNT_FROM} WHERE {where_clause}", params)
             total = cursor.fetchone()[0]
 
             offset = (page - 1) * pageSize
@@ -188,6 +219,49 @@ def list_service_calls(
         return err(500, f"Error de SAP B1: {db_err}")
     except Exception as e:
         return err(500, f"Error interno: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1b) GET /serviceCallStatuses — catálogo de estatus (OSCS) con conteo de ODS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/serviceCallStatuses",
+    summary="Catálogo de estatus de ODS (OSCS) con conteo de órdenes por estatus",
+)
+def list_service_call_statuses(
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """Los estatus de ODS son configurables en SAP (tabla OSCS; el cliente creó
+    los suyos espejo de las fases de CM, ej. '02-Esperando Rampa'). Devuelve TODOS
+    los estatus con su conteo en OSCL (0 si ninguno) para pintar filtros dinámicos."""
+    _, database = resolve_db(x_sap_db)
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT  OSCS.statusID,
+                        OSCS.Name,
+                        COUNT(OSCL.callID) AS Cnt
+                FROM    OSCS
+                LEFT    JOIN OSCL ON OSCL.status = OSCS.statusID
+                GROUP   BY OSCS.statusID, OSCS.Name
+                ORDER   BY OSCS.statusID
+                """
+            )
+            statuses = [
+                {"statusID": int(r.statusID), "name": r.Name, "count": int(r.Cnt)}
+                for r in cursor.fetchall()
+            ]
+            total = sum(s["count"] for s in statuses)
+            return {"success": True, "message": None, "statuses": statuses, "total": total}
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,6 +302,11 @@ _DETAIL_HEADER = """
             OHEM.firstName + ISNULL(' ' + OHEM.lastName, '') AS TecnicoName,
             OINS.manufSN         AS EquipManufSN,
             OINS.internalSN      AS EquipInternalSN,
+            OINS.U_Ps_Marca      AS EquipMarca,
+            OINS.U_Ps_SubMarca   AS EquipSubMarca,
+            OINS.U_Ps_Modelo     AS EquipModelo,
+            OINS.U_Ps_Placa      AS EquipPlaca,
+            OINS.U_Ps_Color      AS EquipColor,
             OITM.ItemName        AS ItemFullName
     FROM    OSCL
     LEFT    JOIN OCRD ON OCRD.CardCode    = OSCL.customer
@@ -262,6 +341,13 @@ def _build_header(r) -> Dict[str, Any]:
             "ItemName":     r.ItemFullName,
             "ManufSN":      r.EquipManufSN or r.ManufSN,
             "InternalSN":   r.EquipInternalSN or r.internalSN,
+            # Datos de la moto según la TARJETA DE EQUIPO (U_Ps_* de OINS).
+            # Modelo = AÑO (el cliente lo maneja como "Modelo (Año)").
+            "Marca":        (r.EquipMarca or "").strip() or None,
+            "SubMarca":     (r.EquipSubMarca or "").strip() or None,
+            "Modelo":       str(r.EquipModelo) if r.EquipModelo is not None else None,
+            "Placa":        (r.EquipPlaca or "").strip() or None,
+            "Color":        (r.EquipColor or "").strip() or None,
         },
         "Status": {
             "Code":         status_code,
@@ -811,6 +897,8 @@ def serial_lookup(
                     OINS.U_Ps_SubMarca  AS VehModel,   -- Modelo (DUKE, NINJA 400…)
                     CAST(OINS.U_Ps_Modelo AS NVARCHAR(10)) AS VehYear,  -- Año (2026)
                     OINS.U_Ps_Placa     AS VehPlate,   -- Placa
+                    OINS.U_Ps_Color     AS VehColor,   -- Color
+                    OCRD.E_Mail         AS CustomerEmail,
                     'Tarjeta de Equipo' AS Notes
                 FROM OINS
                 LEFT JOIN OITB ON OITB.ItmsGrpCod = OINS.itemGroup
@@ -848,6 +936,8 @@ def serial_lookup(
                     "Model":        r.VehModel,
                     "Year":         r.VehYear,
                     "LicensePlate": r.VehPlate,
+                    "Color":        r.VehColor,
+                    "CustomerEmail": r.CustomerEmail,
                 }
                 for r in cursor.fetchall()
             ]
