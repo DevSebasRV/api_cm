@@ -20,6 +20,7 @@ from typing import Optional, Any
 from decimal import Decimal
 import datetime
 import json
+import time
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -874,6 +875,90 @@ def list_cm_service_advisors(repairShopId: int):
         "isActive": u.get("isActive"),
     } for u in raw if isinstance(u, dict) and u.get("userId")]
     return {"success": True, "message": None, "data": {"advisors": advisors}}
+
+
+@router.post(
+    "/orders/{folio}/linkAppointment",
+    summary="Liga una cita (appointment) a una orden existente en ClearMechanic",
+)
+def link_appointment_to_order(
+    folio:             str,
+    repairShopId:      int = Body(..., embed=True),
+    appointmentNumber: str = Body(..., embed=True),
+):
+    """Liga la cita a la orden vía `PATCH /cm/v2/orders/{folio}` con `appointmentNumber`
+    (el campo NO está documentado en el swagger, pero funciona). El vínculo se refleja
+    del lado de la CITA (`status=OrderCreated` + `orderNumber`); el `cmosAppointmentId`
+    de la orden SIEMPRE queda None, por eso se verifica releyendo la cita. Es 1:1: si
+    la orden ya está ligada, CM responde 409 ORDER_ALREADY_LINKED. Requiere que la
+    orden YA exista en CM."""
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado.")
+    guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
+    if not guid:
+        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+    appt = str(appointmentNumber).strip()
+    if not appt:
+        return err(400, "Falta el número de cita (appointmentNumber).")
+
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+
+    headers = {"Authorization": f"Bearer {token}"}
+    folio_q = urllib.parse.quote(str(folio))
+
+    # PATCH que crea el vínculo. El body lleva orderNumber (identificador) + appointmentNumber.
+    url = f"{CM_API_BASE}/v2/orders/{folio_q}?workshopId={guid}"
+    st, resp = _http_patch_json(url, {"orderNumber": str(folio), "appointmentNumber": appt}, headers)
+
+    if st == 409 or "ALREADY_LINKED" in str(resp):
+        # La orden ya está ligada a otra cita (posiblemente a esta misma).
+        detail = resp
+        try:
+            detail = json.loads(resp).get("message", resp)
+        except Exception:
+            pass
+        return err(409, f"Esta orden ya está ligada a una cita en ClearMechanic. {detail}")
+
+    if st not in (200, 201):
+        detail = resp
+        try:
+            j = json.loads(resp)
+            detail = j.get("message") or (j.get("data") or {}).get("message") or resp
+        except Exception:
+            pass
+        return err(502, f"ClearMechanic rechazó la liga (HTTP {st}): {detail}")
+
+    # Verificamos del lado de la CITA. El orderNumber se llena con retraso eventual,
+    # así que reintentamos un par de veces.
+    status_val, order_no = None, None
+    appt_url = f"{CM_API_BASE}/appointments/{urllib.parse.quote(appt)}?workshopId={guid}"
+    for _ in range(4):
+        gs, gb = _http_get_json(appt_url, headers)
+        if gs == 200:
+            try:
+                d = json.loads(gb).get("data", {}) or {}
+                status_val = d.get("status")
+                order_no   = d.get("orderNumber")
+            except Exception:
+                pass
+            if status_val == "OrderCreated" and order_no:
+                break
+        time.sleep(1)
+
+    linked = (status_val == "OrderCreated")
+    if not linked:
+        return err(
+            502,
+            f"El PATCH respondió OK pero la cita no quedó ligada (status={status_val}). "
+            f"Revisa en ClearMechanic.",
+        )
+    return {
+        "success": True, "message": None,
+        "data": {"linked": True, "status": status_val,
+                 "orderNumber": order_no, "appointmentNumber": appt},
+    }
 
 
 @router.get(
