@@ -21,6 +21,7 @@ from decimal import Decimal
 import datetime
 import json
 import time
+import re
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -913,22 +914,15 @@ def link_appointment_to_order(
     st, resp = _http_patch_json(url, {"orderNumber": str(folio), "appointmentNumber": appt}, headers)
 
     if st == 409 or "ALREADY_LINKED" in str(resp):
-        # La orden ya está ligada a otra cita (posiblemente a esta misma).
-        detail = resp
-        try:
-            detail = json.loads(resp).get("message", resp)
-        except Exception:
-            pass
-        return err(409, f"Esta orden ya está ligada a una cita en ClearMechanic. {detail}")
+        # La orden ya está ligada a otra cita. Mensaje limpio (sin jerga técnica),
+        # extrayendo el número de cita ligada si CM lo reporta.
+        m = re.search(r"appointment\s+(\d+)", str(resp))
+        otra = f" (cita #{m.group(1)})" if m else ""
+        return err(409, f"Esta orden ya está ligada a otra cita{otra}.")
 
     if st not in (200, 201):
-        detail = resp
-        try:
-            j = json.loads(resp)
-            detail = j.get("message") or (j.get("data") or {}).get("message") or resp
-        except Exception:
-            pass
-        return err(502, f"ClearMechanic rechazó la liga (HTTP {st}): {detail}")
+        return err(502, "No se pudo ligar la cita en ClearMechanic. "
+                        "Verifica que la orden ya exista en ClearMechanic e inténtalo de nuevo.")
 
     # Verificamos del lado de la CITA. El orderNumber se llena con retraso eventual,
     # así que reintentamos un par de veces.
@@ -949,11 +943,7 @@ def link_appointment_to_order(
 
     linked = (status_val == "OrderCreated")
     if not linked:
-        return err(
-            502,
-            f"El PATCH respondió OK pero la cita no quedó ligada (status={status_val}). "
-            f"Revisa en ClearMechanic.",
-        )
+        return err(502, "La cita no quedó ligada. Revísala en ClearMechanic e inténtalo de nuevo.")
     return {
         "success": True, "message": None,
         "data": {"linked": True, "status": status_val,
