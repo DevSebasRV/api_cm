@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import EMPRESAS
 from app.database import get_connection
-from app.routers import inventory, business_partners, shopify, service_calls, clearmechanic
+from app.routers import inventory, business_partners, shopify, service_calls, clearmechanic, cfdi_reconcile
 
 app = FastAPI(
     title="SAP B1 - ClearMechanic Middleware",
@@ -25,6 +25,7 @@ app.include_router(business_partners.router)
 app.include_router(shopify.router)
 app.include_router(service_calls.router)
 app.include_router(clearmechanic.router)
+app.include_router(cfdi_reconcile.router)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
