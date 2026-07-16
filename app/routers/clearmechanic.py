@@ -39,23 +39,30 @@ router = APIRouter(prefix="/clearmechanic", tags=["ClearMechanic"])
 #   GET /api/cm/phases?workshopId=<GUID del taller>
 # (el GUID aparece en el mensaje de error si mandas un phaseId inválido).
 _PHASE_BY_SHOP = {
-    4105: {"21": "22212"},   # Roma — status SAP 21 = "Esperando Rampa"
+    4105: {"21": "22212"},   # TONALÁ (antes "Roma") — status SAP 21 = "Esperando Rampa"
 }
 
 # Fase de ENTRADA por taller. Una orden recién creada en el portal entra en esta
-# fase sin importar su status SAP (el form crea con status -3 "Abierto" por
-# defecto, que no tiene override). El phaseId es distinto en cada taller.
-#   Roma (4105) → 22212 "Esperando Rampa".
-# Saca los phaseId de un taller con GET /api/cm/phases?workshopId=<GUID>.
+# fase sin importar su status SAP. El phaseId es distinto en cada taller.
+# ⚠️ OPCIONAL: si un taller NO está aquí, la orden se crea SIN fase (CM la deja
+# en "noPhase" — probado). Así los talleres sin fase configurada YA funcionan
+# (antes se abortaba y solo 4105 servía). Para poner la fase real de un taller,
+# saca sus phaseId con GET /api/cm/phases?workshopId=<GUID de ese taller>.
+#   Talleres: 2948=FERBEL, 2947=PROSHOP, 4105=TONALÁ, 4104=COAPA.
 _DEFAULT_PHASE_BY_SHOP = {
-    4105: "22212",   # Roma — "Esperando Rampa"
+    4105: "22212",   # TONALÁ — "Esperando Rampa"
 }
 
-# workshopId (GUID) por taller. El POST/PATCH de inspectionItems exige el GUID en
-# query (NO el repairShopId numérico). Para agregar un taller, saca su GUID con
-# GET /api/cm/phases?workshopId=<GUID> (aparece en el error si mandas fase inválida).
+# workshopId (GUID / "RepairShopKey") por taller. Lo EXIGEN citas, puntos de
+# inspección (crear/editar), estimates, ligar cita y PATCH de orden (NO el
+# repairShopId numérico). El GUID NO es descubrible por API (verificado); se
+# obtiene del dashboard de ClearMechanic o de su soporte. Agregar aquí el de
+# cada taller para habilitar esas features fuera de TONALÁ.
 _WORKSHOP_GUID_BY_SHOP = {
-    4105: "5950971e-41c4-4202-bf54-8b4514768163",   # Roma
+    4105: "5950971e-41c4-4202-bf54-8b4514768163",   # TONALÁ (antes "Roma")
+    # 2948: "<GUID FERBEL>",    # ← pendiente (pedir a ClearMechanic)
+    # 2947: "<GUID PROSHOP>",   # ← pendiente
+    # 4104: "<GUID COAPA>",     # ← pendiente
 }
 
 # Color del portal → priority de CM. Rojo=Urgent, Amarillo=Med, Verde=Low.
@@ -268,18 +275,15 @@ def create_cm_order(
     if not rows:
         return err(404, f"No se encontró la ODS con folio '{folio}' en la base.")
 
-    # Fase de CM según el taller. El phaseId es distinto por taller.
+    # Fase de CM según el taller. El phaseId es distinto por taller y es OPCIONAL:
+    # si el taller no tiene fase configurada, `phase` = None y NO se manda (CM crea
+    # la orden en "noPhase"). Antes esto abortaba y bloqueaba todo taller != 4105.
     status_raw = str(rows[0][15]) if rows[0][15] is not None else ""
     phase = _resolve_phase(repairShopId, status_raw)
-    if phase is None:
-        return err(
-            400,
-            f"El taller {repairShopId} no tiene fase de CM configurada. "
-            f"Agrégalo en _DEFAULT_PHASE_BY_SHOP "
-            f"(saca el phaseId con GET /api/cm/phases?workshopId=<GUID>).",
-        )
 
     payload = _build_order_json(rows[0], phase)
+    if phase is None:
+        payload.pop("phase", None)
 
     # Los datos de vehículo del portal tienen prioridad (en SAP no se guardan
     # de forma confiable). El VIN sí sale del SQL (OSCL.internalSN de la ODS).
@@ -387,7 +391,8 @@ def list_cm_phases(repairShopId: int):
         return err(500, "ClearMechanic no está configurado.")
     guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
     if not guid:
-        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+        return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
+                   f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
     token = _cm_login()
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
@@ -414,7 +419,8 @@ def patch_cm_order(
         return err(500, "ClearMechanic no está configurado.")
     guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
     if not guid:
-        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+        return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
+                   f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
 
     token = _cm_login()
     if not token:
@@ -600,7 +606,8 @@ def create_inspection_item(
         return err(500, "ClearMechanic no está configurado (faltan CM_USER / CM_PASSWORD).")
     guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
     if not guid:
-        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado en _WORKSHOP_GUID_BY_SHOP.")
+        return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
+                        f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
     if priority not in _PRIORITY_VALUES:
         return err(400, f"priority inválido '{priority}'. Usa: Low | Med | Urgent.")
 
@@ -653,7 +660,8 @@ def patch_inspection_item(
         return err(500, "ClearMechanic no está configurado.")
     guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
     if not guid:
-        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+        return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
+                   f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
     if priority is not None and priority not in _PRIORITY_VALUES:
         return err(400, f"priority inválido '{priority}'. Usa: Low | Med | Urgent.")
 
@@ -699,7 +707,8 @@ def add_inspection_estimates(
         return err(500, "ClearMechanic no está configurado.")
     guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
     if not guid:
-        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+        return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
+                   f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
 
     items = _estimates_for_cm(estimates)
     if not items:
@@ -788,7 +797,8 @@ def list_cm_appointments(
         return err(500, "ClearMechanic no está configurado.")
     guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
     if not guid:
-        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+        return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
+                   f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
     if not dateFrom:
         return err(400, "dateFrom es obligatorio (formato YYYY-MM-DD).")
 
@@ -856,7 +866,8 @@ def create_cm_appointment(
         return err(500, "ClearMechanic no está configurado.")
     guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
     if not guid:
-        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+        return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
+                   f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
 
     cust = customer or {}
     first  = (cust.get("firstName") or "").strip()
@@ -962,7 +973,8 @@ def list_cm_service_advisors(repairShopId: int):
         return err(500, "ClearMechanic no está configurado.")
     guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
     if not guid:
-        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+        return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
+                   f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
 
     token = _cm_login()
     if not token:
@@ -1013,7 +1025,8 @@ def link_appointment_to_order(
         return err(500, "ClearMechanic no está configurado.")
     guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
     if not guid:
-        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+        return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
+                   f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
     appt = str(appointmentNumber).strip()
     if not appt:
         return err(400, "Falta el número de cita (appointmentNumber).")
@@ -1078,7 +1091,8 @@ def list_cm_custom_reasons(repairShopId: int):
         return err(500, "ClearMechanic no está configurado.")
     guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
     if not guid:
-        return err(400, f"El taller {repairShopId} no tiene workshopId (GUID) configurado.")
+        return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
+                   f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
 
     token = _cm_login()
     if not token:
