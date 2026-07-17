@@ -58,11 +58,16 @@ _DEFAULT_PHASE_BY_SHOP = {
 # repairShopId numérico). El GUID NO es descubrible por API (verificado); se
 # obtiene del dashboard de ClearMechanic o de su soporte. Agregar aquí el de
 # cada taller para habilitar esas features fuera de TONALÁ.
+# El mapeo repairShopId→GUID fue VERIFICADO técnicamente (cruce cita ligada →
+# orden → cliente), NO por nombre: los nombres de sucursal de CM (ROMA/SUR/
+# SATELITE/PATRIOTISMO) NO coinciden con los del portal (TONALÁ/COAPA/FERBEL/
+# PROSHOP). El código usa el NÚMERO, así que la discrepancia de nombres es solo
+# cosmética.
 _WORKSHOP_GUID_BY_SHOP = {
-    4105: "5950971e-41c4-4202-bf54-8b4514768163",   # TONALÁ (antes "Roma")
-    # 2948: "<GUID FERBEL>",    # ← pendiente (pedir a ClearMechanic)
-    # 2947: "<GUID PROSHOP>",   # ← pendiente
-    # 4104: "<GUID COAPA>",     # ← pendiente
+    4105: "5950971e-41c4-4202-bf54-8b4514768163",   # TONALÁ  (CM: "ROMA")
+    4104: "64e4cbbe-18c2-428e-9386-511ddc5b034f",   # COAPA   (CM: "SUR")
+    2948: "1f0486ab-eb46-419d-963d-f38f65934929",   # FERBEL  (CM: "SATELITE")
+    2947: "2ca9d433-7372-4691-bcc5-1f5921603105",   # PROSHOP (CM: "PATRIOTISMO")
 }
 
 # Color del portal → priority de CM. Rojo=Urgent, Amarillo=Med, Verde=Low.
