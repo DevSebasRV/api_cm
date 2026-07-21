@@ -740,6 +740,89 @@ def add_inspection_estimates(
     return {"success": True, "message": None, "added": added, "errors": errors}
 
 
+def _http_delete(url: str, headers: Optional[dict] = None):
+    """DELETE con urllib. Devuelve (status_code, texto_respuesta)."""
+    req = urllib.request.Request(url, headers=headers or {}, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+@router.post(
+    "/orders/{folio}/inspection/{item_id}/estimates/replace",
+    summary="Reemplaza los estimates de un punto de inspección (sincroniza una oferta editada)",
+)
+def replace_inspection_estimates(
+    folio:        str,
+    item_id:      int,
+    repairShopId: int  = Body(..., embed=True),
+    estimates:    list = Body(default=[], embed=True, description="Set FINAL de artículos {itemCode,name,quantity,unitPrice}"),
+):
+    """Al editar en el portal una oferta ligada a un punto de inspección, CM debe
+    reflejar las líneas nuevas. CM no permite editar estimates en bloque, pero SÍ
+    borrarlos y agregarlos individualmente (verificado: DELETE→204, POST→201).
+    Flujo: lee los estimates actuales del punto (orden v2) → borra cada uno →
+    sube el set final."""
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado.")
+    guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
+    if not guid:
+        return err(400, f"El taller {repairShopId} aún no está configurado para inspección "
+                   f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
+
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1) Estimates actuales del punto (la orden v2 trae parts[] y labors[] con id)
+    url = f"{CM_API_BASE}/v2/orders/{urllib.parse.quote(str(folio))}?workshopId={guid}"
+    status, resp = _http_get_json(url, headers)
+    if status != 200:
+        return err(502, f"No se pudo leer la orden en ClearMechanic (HTTP {status}).")
+    try:
+        items = (json.loads(resp).get("data") or {}).get("inspectionItems") or []
+    except Exception:
+        items = []
+    punto = next((i for i in items if int(i.get("cmosInspectionItemId") or 0) == int(item_id)), None)
+    if punto is None:
+        return err(404, "El punto de inspección ya no existe en ClearMechanic.")
+
+    viejos = [e.get("cmosEstimateId")
+              for e in (punto.get("parts") or []) + (punto.get("labors") or [])
+              if e.get("cmosEstimateId")]
+
+    # 2) Borrar los estimates actuales
+    base = (f"{CM_ORDERS_URL}/{urllib.parse.quote(str(folio))}"
+            f"/inspectionItems/{int(item_id)}/estimates")
+    borrados = 0
+    for eid in viejos:
+        st, _ = _http_delete(f"{base}/{int(eid)}?workshopId={guid}", headers)
+        if st in (200, 204):
+            borrados += 1
+
+    # 3) Subir el set final (CM acepta 1 estimate por POST)
+    nuevos = _estimates_for_cm(estimates)
+    added = 0
+    errors: list = []
+    for e in nuevos:
+        st, resp = _http_post_json(f"{base}?workshopId={guid}", e, headers)
+        if st in (200, 201):
+            added += 1
+        else:
+            detail = resp
+            try:
+                detail = json.loads(resp).get("message", resp)
+            except Exception:
+                pass
+            errors.append(f"{e.get('estimateName') or e.get('partId')}: HTTP {st} {detail}")
+
+    return {"success": True, "message": None,
+            "removed": borrados, "added": added, "errors": errors}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CITAS (appointments) de ClearMechanic
 #   - GET  /appointments        → lista citas del taller (por rango de fecha)
