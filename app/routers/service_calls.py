@@ -1289,12 +1289,14 @@ def list_customer_equipment(
 )
 def quote_article_search(
     keyword:  str           = Query(..., min_length=2, description="Texto: busca en ItemCode e ItemName"),
+    whs:      Optional[str] = Query(default=None, description="Almacén del vendedor: agrega OnHandWhs (existencia en ese almacén)"),
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
 ):
     """
     Devuelve hasta 25 artículos vendibles (OITM.SellItem='Y', no cancelados) que
     coincidan con el texto en código o nombre, con su precio de la lista
-    PRICE_LIST_CODE (ITM1). Cada palabra debe coincidir (AND).
+    PRICE_LIST_CODE (ITM1), el stock total (OITM.OnHand) y, si se manda `whs`,
+    el stock en ese almacén (OITW). Cada palabra debe coincidir (AND).
     """
     _, database = resolve_db(x_sap_db)
     words = [w for w in keyword.strip().split() if w]
@@ -1302,7 +1304,7 @@ def quote_article_search(
         return {"success": True, "articles": []}
 
     clause = " AND ".join("(OITM.ItemCode LIKE ? OR OITM.ItemName LIKE ?)" for _ in words)
-    params: list = [PRICE_LIST_CODE]
+    params: list = [PRICE_LIST_CODE, (whs or "").strip()]
     for w in words:
         like = f"%{w}%"
         params += [like, like]
@@ -1312,9 +1314,11 @@ def quote_article_search(
             OITM.ItemCode,
             OITM.ItemName,
             OITM.OnHand,
-            ISNULL(ITM1.Price, 0) AS Price
+            ISNULL(ITM1.Price, 0)  AS Price,
+            ISNULL(OITW.OnHand, 0) AS OnHandWhs
         FROM   OITM
         LEFT   JOIN ITM1 ON ITM1.ItemCode = OITM.ItemCode AND ITM1.PriceList = ?
+        LEFT   JOIN OITW ON OITW.ItemCode = OITM.ItemCode AND OITW.WhsCode = ?
         WHERE  ISNULL(OITM.Canceled,'N') = 'N'
           AND  ISNULL(OITM.SellItem,'Y') = 'Y'
           AND  {clause}
@@ -1327,10 +1331,11 @@ def quote_article_search(
             cursor.execute(sql, params)
             articles = [
                 {
-                    "ItemCode": r.ItemCode,
-                    "ItemName": r.ItemName,
-                    "Price":    float(r.Price)  if r.Price  is not None else 0.0,
-                    "OnHand":   float(r.OnHand) if r.OnHand is not None else 0.0,
+                    "ItemCode":  r.ItemCode,
+                    "ItemName":  r.ItemName,
+                    "Price":     float(r.Price)     if r.Price     is not None else 0.0,
+                    "OnHand":    float(r.OnHand)    if r.OnHand    is not None else 0.0,
+                    "OnHandWhs": float(r.OnHandWhs) if r.OnHandWhs is not None else 0.0,
                 }
                 for r in cursor.fetchall()
             ]
