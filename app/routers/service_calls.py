@@ -142,6 +142,8 @@ def list_service_calls(
     cardCode: Optional[str] = Query(default=None, description="Filtra por CardCode exacto"),
     status:   Optional[int] = Query(default=None, description="Filtra por statusID (-3=Open, -2=Closed)"),
     keyword:  Optional[str] = Query(default=None, description="Búsqueda libre en Subject / CustomerName / ItemCode / ItemName"),
+    sucursal: Optional[str] = Query(default=None,
+        description="Limita a órdenes cuyo asesor (assignee) pertenece a esa sucursal (OUBR.Name)"),
     page:     int           = Query(default=1, ge=1),
     pageSize: int           = Query(default=20, ge=1, le=200),
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
@@ -179,6 +181,16 @@ def list_service_calls(
             clause += ")"
             where_parts.append(clause)
             params += params_w
+
+    # Sucursal: la ODS no trae sucursal propia (verificado: OSCL solo tiene la
+    # serie, que codifica MARCA); se usa la sucursal del ASESOR asignado.
+    # Órdenes sin asesor o con asesor sin sucursal quedan fuera del filtro.
+    if sucursal and sucursal.strip():
+        where_parts.append(
+            "OSCL.assignee IN (SELECT h.empID FROM OHEM h "
+            "JOIN OUBR b ON b.Code = h.branch WHERE b.Name = ?)"
+        )
+        params.append(sucursal.strip())
 
     where_clause = " AND ".join(where_parts)
 
@@ -229,6 +241,8 @@ def list_service_calls(
     summary="Catálogo de estatus de ODS (OSCS) con conteo de órdenes por estatus",
 )
 def list_service_call_statuses(
+    sucursal: Optional[str] = Query(default=None,
+        description="Cuenta solo órdenes cuyo asesor pertenece a esa sucursal (OUBR.Name)"),
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
 ):
     """Los estatus de ODS son configurables en SAP (tabla OSCS; el cliente creó
@@ -239,16 +253,26 @@ def list_service_call_statuses(
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
+            # Con sucursal, el conteo solo incluye órdenes de asesores de esa
+            # sucursal (mismo criterio que el listado). El JOIN extra vive en el
+            # ON para que TODOS los estatus sigan apareciendo (con 0 si aplica).
+            join_suc = ""
+            qparams: List[Any] = []
+            if sucursal and sucursal.strip():
+                join_suc = (" AND OSCL.assignee IN (SELECT h.empID FROM OHEM h "
+                            "JOIN OUBR b ON b.Code = h.branch WHERE b.Name = ?)")
+                qparams = [sucursal.strip()]
             cursor.execute(
-                """
+                f"""
                 SELECT  OSCS.statusID,
                         OSCS.Name,
                         COUNT(OSCL.callID) AS Cnt
                 FROM    OSCS
-                LEFT    JOIN OSCL ON OSCL.status = OSCS.statusID
+                LEFT    JOIN OSCL ON OSCL.status = OSCS.statusID{join_suc}
                 GROUP   BY OSCS.statusID, OSCS.Name
                 ORDER   BY OSCS.statusID
-                """
+                """,
+                qparams,
             )
             statuses = [
                 {"statusID": int(r.statusID), "name": r.Name, "count": int(r.Cnt)}
