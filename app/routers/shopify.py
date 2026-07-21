@@ -10,12 +10,8 @@ from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any, List
 import pyodbc
 
-from app.config import (
-    EMPRESAS,
-    SHOPIFY_COMPARE_AT_PRICE_LIST,
-    # SHOPIFY_VARIANT_PRICE_LIST queda en config por si se reactiva,
-    # pero por ahora no se usa: Variant Price devuelve 0.0 fijo.
-)
+# Variant Price se responde fijo en 0.0 (no hay lista de precios para él).
+from app.config import EMPRESAS, SHOPIFY_COMPARE_AT_PRICE_LIST
 from app.database import get_connection
 from app.security import require_api_key
 
@@ -29,32 +25,10 @@ router = APIRouter(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers comunes
+# Helpers comunes → viven en app/routers/common.py (compartidos por routers)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Si el cliente no manda X-SAP-DB usamos la base de TEST por seguridad
-# (jamás escribimos por accidente sobre producción).
-DEFAULT_DB_KEY = "test"
-
-
-def resolve_db(x_sap_db: Optional[str]) -> tuple[str, str]:
-    """Resuelve la base SAP B1 a usar a partir del header X-SAP-DB.
-    Si no se manda el header, cae al default (`test`).
-    Devuelve (db_key, database_name)."""
-    key = (x_sap_db or DEFAULT_DB_KEY).lower()
-    if key not in EMPRESAS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"X-SAP-DB '{x_sap_db}' no válida. Usa: {list(EMPRESAS.keys())}.",
-        )
-    database = EMPRESAS[key]
-    if not database:
-        raise HTTPException(
-            status_code=500,
-            detail=f"La base '{key}' no está configurada en .env "
-                   f"(falta SAP_DATABASE_{key.upper()}).",
-        )
-    return key, database
+from app.routers.common import DEFAULT_DB_KEY, resolve_db, err, _pagination  # noqa: F401
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,21 +95,6 @@ def _build_stock_for_item(rows, db_key: str) -> Dict[str, int]:
     return result
 
 
-def err(status: int, message: str):
-    return JSONResponse(
-        status_code=status,
-        content={"success": False, "message": message, "data": None},
-    )
-
-
-def _pagination(page: int, page_size: int, total: int) -> Dict[str, Any]:
-    total_pages = max(1, (total + page_size - 1) // page_size)
-    return {
-        "page":       page,
-        "pageSize":   page_size,
-        "total":      total,
-        "totalPages": total_pages,
-    }
 
 
 # Filtro central: existencia en la UDT @SHOPIFY_ARTICLE con U_Activo='Y'.

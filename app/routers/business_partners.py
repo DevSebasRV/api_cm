@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Header, Query
-from fastapi.responses import JSONResponse
 from typing import Optional
 import pyodbc
 
 from app.config import EMPRESAS
 from app.database import get_connection
+from app.routers.common import err
 
 router = APIRouter(tags=["Business Partners"])
 
@@ -90,12 +90,6 @@ def fetch_bps(cursor, page: int, page_size: int, keyword: Optional[str] = None):
     return [build_bp(row) for row in cursor.fetchall()], total
 
 
-def err(status: int, message: str):
-    return JSONResponse(status_code=status, content={
-        "success": False,
-        "message": message,
-        "data":    None,
-    })
 
 
 @router.get(
@@ -175,16 +169,19 @@ def next_card_code(
             prefix_len = len(prefix)
             # Buscamos códigos que empiezan con el prefijo y donde el resto es numérico.
             # Tomamos el de mayor valor numérico, no el de mayor longitud de string.
+            # `prefix` va parametrizado (?) — nunca interpolado en el SQL.
+            # Los índices numéricos derivan de len(prefix) (int), que sí es seguro.
             cursor.execute(
                 f"""
                 SELECT TOP 1 CardCode
                 FROM   OCRD
-                WHERE  CardCode LIKE '{prefix}%'
+                WHERE  CardCode LIKE ? + '%'
                   AND  CardType = 'C'
                   AND  LEN(CardCode) > {prefix_len}
                   AND  SUBSTRING(CardCode, {prefix_len + 1}, LEN(CardCode)) NOT LIKE '%[^0-9]%'
                 ORDER BY CAST(SUBSTRING(CardCode, {prefix_len + 1}, LEN(CardCode)) AS BIGINT) DESC
-                """
+                """,
+                [prefix],
             )
             row = cursor.fetchone()
             if row and row.CardCode:

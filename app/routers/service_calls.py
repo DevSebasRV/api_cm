@@ -20,15 +20,14 @@ Y para los documentos vinculados (vía SCL3.ObjType + DocEntry):
 """
 
 from fastapi import APIRouter, Header, Query
-from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any, List
 import datetime
 import re
 import pyodbc
 
-from app.config import EMPRESAS, PRICE_LIST_CODE
+from app.config import PRICE_LIST_CODE
 from app.database import get_connection
-from app.routers.shopify import resolve_db, err, _pagination  # reutilizamos helpers
+from app.routers.common import resolve_db, err, _pagination
 
 router = APIRouter(tags=["Service Calls"])
 

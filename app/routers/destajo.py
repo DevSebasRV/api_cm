@@ -18,7 +18,7 @@ import datetime
 import pyodbc
 
 from app.database import get_connection
-from app.routers.shopify import resolve_db, err
+from app.routers.common import resolve_db, err
 
 router = APIRouter(tags=["Destajo"])
 

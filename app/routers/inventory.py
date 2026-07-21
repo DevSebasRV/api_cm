@@ -5,6 +5,7 @@ import pyodbc
 
 from app.config import EMPRESAS, PRICE_LIST_CODE
 from app.database import get_connection, get_warehouse_stock
+from app.routers.common import err
 
 router = APIRouter(tags=["Inventory Items"])
 
@@ -32,14 +33,6 @@ def ok_parts(parts: list, page: int = None, page_size: int = None, total: int = 
         }
     body["parts"] = parts
     return JSONResponse(status_code=200, content=body)
-
-def err(status: int, message: str):
-    return JSONResponse(status_code=status, content={
-        "success": False,
-        "message": message,
-        "data":    None,
-    })
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Construcción del objeto part
@@ -252,12 +245,14 @@ def get_inventory_items(
 
             conn   = get_connection(EMPRESAS[empresa])
             cursor = conn.cursor()
-            part   = fetch_single_item(cursor, itemCode, empresa)
-            cursor.close(); conn.close()
+            try:
+                part = fetch_single_item(cursor, itemCode, empresa)
+            finally:
+                cursor.close(); conn.close()
 
             if part is None:
                 return err(404, f"Item '{itemCode}' no encontrado en {empresa}.")
-            return ok_part(part) 
+            return ok_part(part)
 
         # 2. Búsqueda por keyword / listado paginado
         if empresa == "ambas":
@@ -265,8 +260,10 @@ def get_inventory_items(
         else:
             conn   = get_connection(EMPRESAS[empresa])
             cursor = conn.cursor()
-            parts, total = fetch_items(cursor, page, pageSize, empresa, keyword or None)
-            cursor.close(); conn.close()
+            try:
+                parts, total = fetch_items(cursor, page, pageSize, empresa, keyword or None)
+            finally:
+                cursor.close(); conn.close()
 
         return ok_parts(parts, page=page, page_size=pageSize, total=total)
 

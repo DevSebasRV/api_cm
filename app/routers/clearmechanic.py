@@ -15,7 +15,6 @@ Usa urllib (stdlib) para no agregar dependencias (no hay `requests`/`httpx`).
 """
 
 from fastapi import APIRouter, Header, Body
-from fastapi.responses import JSONResponse
 from typing import Optional, Any
 from decimal import Decimal
 import datetime
@@ -29,6 +28,7 @@ import pyodbc
 
 from app.config import EMPRESAS, CM_LOGIN_URL, CM_ORDERS_URL, CM_USER, CM_PASSWORD
 from app.database import get_connection
+from app.routers.common import err
 
 router = APIRouter(prefix="/clearmechanic", tags=["ClearMechanic"])
 
@@ -137,13 +137,6 @@ _ODS_SELECT = """
         LEFT JOIN OHEM T5 ON T0.technician = T5.empID
     WHERE T0.callID = ?
 """
-
-
-def err(status: int, message: str, extra: Optional[dict] = None):
-    body = {"success": False, "message": message, "data": None}
-    if extra:
-        body.update(extra)
-    return JSONResponse(status_code=status, content=body)
 
 
 def _jsonable(v: Any) -> Any:

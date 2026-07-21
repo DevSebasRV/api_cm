@@ -2,3 +2,6 @@ fastapi==0.111.0
 uvicorn==0.29.0
 pyodbc==5.1.0
 python-dotenv==1.0.1
+# pydantic viene con fastapi, pero se declara explícito porque el código
+# lo importa directo (routers/shopify.py: BaseModel/Field).
+pydantic>=2,<3

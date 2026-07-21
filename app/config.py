@@ -21,9 +21,9 @@ PRICE_LIST_CODE = 1
 # ─────────────────────────────────────────────────────────────────────────────
 # Shopify integration
 # ─────────────────────────────────────────────────────────────────────────────
-# Listas de precios que se mapean a los campos de Shopify.
-# Pueden sobrescribirse vía .env si los códigos cambian por base.
-SHOPIFY_VARIANT_PRICE_LIST    = int(os.getenv("SHOPIFY_VARIANT_PRICE_LIST",    "2"))  # "Precio descuento"
+# Lista de precios que se mapea al campo Compare At Price de Shopify.
+# Puede sobrescribirse vía .env si el código cambia por base.
+# (El Variant Price se responde fijo en 0.0 — ver routers/shopify.py.)
 SHOPIFY_COMPARE_AT_PRICE_LIST = int(os.getenv("SHOPIFY_COMPARE_AT_PRICE_LIST", "1"))  # "LISTA DE PRECIOS 01"
 
 # ─────────────────────────────────────────────────────────────────────────────
