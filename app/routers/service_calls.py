@@ -1015,6 +1015,9 @@ def validate_service_call_codes(
 )
 def get_catalogs(
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+    sucursal: Optional[str] = Query(default=None,
+        description="Nombre de sucursal (OUBR.Name). Si se manda, Asesor y "
+                    "Técnico se limitan a empleados de esa sucursal."),
 ):
     """
     Devuelve los catálogos que el form de creación necesita:
@@ -1024,8 +1027,13 @@ def get_catalogs(
     - OHEM Empleados activos (asesores y técnicos)
     - NNM1 Series (numeración para Service Calls, ObjectCode='191')
     - Prioridades hardcoded (L/M/H)
+
+    Si `sucursal` viene, se filtran asesores/técnicos a esa sucursal
+    (OHEM.branch → OUBR.Name). Si la sucursal no existe en esta base o no
+    tiene empleados, se cae a la lista completa (para no bloquear el alta).
     """
     _, database = resolve_db(x_sap_db)
+    sucursal = (sucursal or "").strip() or None
 
     try:
         conn   = get_connection(database)
@@ -1043,46 +1051,69 @@ def get_catalogs(
             cursor.execute("SELECT statusID, Name FROM OSCS WHERE ISNULL(Active,'Y')='Y' ORDER BY statusID")
             statuses = [{"id": int(r.statusID), "name": r.Name} for r in cursor.fetchall()]
 
-            # Empleados activos (try Active='Y'; si falla, traer todos)
-            try:
-                cursor.execute(
-                    "SELECT empID, firstName, lastName "
-                    "FROM   OHEM "
-                    "WHERE  ISNULL(Active,'Y')='Y' "
-                    "ORDER BY firstName, lastName"
-                )
-            except pyodbc.Error:
-                cursor.execute("SELECT empID, firstName, lastName FROM OHEM ORDER BY firstName, lastName")
-            employees = [
-                {
-                    "id":   int(r.empID),
-                    "name": (f"{r.firstName or ''} {r.lastName or ''}").strip() or f"#{r.empID}",
-                }
-                for r in cursor.fetchall()
-            ]
+            # Filtro por sucursal (OHEM.branch → OUBR.Name). Resolvemos los
+            # códigos de branch de esa sucursal; si no existe en esta base,
+            # branch_codes queda vacío y NO se filtra.
+            branch_codes: List[int] = []
+            if sucursal:
+                try:
+                    cursor.execute("SELECT Code FROM OUBR WHERE Name = ?", [sucursal])
+                    branch_codes = [int(r.Code) for r in cursor.fetchall()]
+                except pyodbc.Error:
+                    branch_codes = []
 
-            # Técnicos: SAP exige que el empleado de OSCL.technician tenga "rol de
-            # técnico". Esa marca NO es una columna simple de OHEM; el set fiable
-            # son los empleados ACTIVOS que ya se han usado como técnico (probado:
-            # SAP los acepta y rechaza al resto con "must be defined as technician").
-            # El asesor (OSCL.assignee) NO tiene esa regla → usa `employees`.
-            try:
-                cursor.execute(
-                    "SELECT empID, firstName, lastName "
-                    "FROM   OHEM "
-                    "WHERE  ISNULL(Active,'Y')='Y' "
-                    "  AND  empID IN (SELECT DISTINCT technician FROM OSCL WHERE technician IS NOT NULL) "
-                    "ORDER BY firstName, lastName"
-                )
-                technicians = [
-                    {
-                        "id":   int(r.empID),
-                        "name": (f"{r.firstName or ''} {r.lastName or ''}").strip() or f"#{r.empID}",
-                    }
+            def _fetch_people(codes: List[int]):
+                """Devuelve (employees, technicians) activos, filtrados por los
+                códigos de sucursal si `codes` no está vacío."""
+                if codes:
+                    ph = ",".join("?" * len(codes))
+                    where_branch = f" AND h.branch IN ({ph}) "
+                    params = list(codes)
+                else:
+                    where_branch, params = "", []
+
+                # Asesores = todos los empleados activos (de la sucursal si aplica)
+                try:
+                    cursor.execute(
+                        "SELECT h.empID, h.firstName, h.lastName "
+                        "FROM   OHEM h "
+                        "WHERE  ISNULL(h.Active,'Y')='Y' " + where_branch +
+                        "ORDER BY h.firstName, h.lastName",
+                        params,
+                    )
+                except pyodbc.Error:
+                    cursor.execute("SELECT empID, firstName, lastName FROM OHEM ORDER BY firstName, lastName")
+                emps = [
+                    {"id": int(r.empID),
+                     "name": (f"{r.firstName or ''} {r.lastName or ''}").strip() or f"#{r.empID}"}
                     for r in cursor.fetchall()
                 ]
-            except pyodbc.Error:
-                technicians = employees   # fallback: si falla, no bloqueamos
+
+                # Técnicos: SAP exige que OSCL.technician tenga "rol de técnico".
+                # El set fiable son los empleados ACTIVOS ya usados como técnico.
+                try:
+                    cursor.execute(
+                        "SELECT h.empID, h.firstName, h.lastName "
+                        "FROM   OHEM h "
+                        "WHERE  ISNULL(h.Active,'Y')='Y' " + where_branch +
+                        "  AND  h.empID IN (SELECT DISTINCT technician FROM OSCL WHERE technician IS NOT NULL) "
+                        "ORDER BY h.firstName, h.lastName",
+                        params,
+                    )
+                    techs = [
+                        {"id": int(r.empID),
+                         "name": (f"{r.firstName or ''} {r.lastName or ''}").strip() or f"#{r.empID}"}
+                        for r in cursor.fetchall()
+                    ]
+                except pyodbc.Error:
+                    techs = emps   # fallback: si falla, no bloqueamos
+                return emps, techs
+
+            employees, technicians = _fetch_people(branch_codes)
+            # Si el filtro por sucursal dejó la lista vacía (sucursal sin
+            # empleados en esta base), caemos a la lista completa.
+            if branch_codes and not employees:
+                employees, technicians = _fetch_people([])
 
             # Series para ServiceCalls (ObjectCode=191)
             try:
@@ -1110,6 +1141,57 @@ def get_catalogs(
                     {"id": "H", "name": "Alta"},
                 ],
             }
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
+@router.get(
+    "/employeeUserCodes",
+    summary="Códigos de usuario de empleados SAP (OHEM.userId → OUSR) con su sucursal",
+)
+def list_employee_user_codes(
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Lista los empleados ACTIVOS que tienen un "código de usuario" de SAP
+    asociado (OHEM.userId → OUSR.USER_CODE), junto con su sucursal
+    (OHEM.branch → OUBR.Name). Se usa en Admin para ligar un usuario del
+    portal a su empleado SAP y, de ahí, deducir su sucursal.
+    """
+    _, database = resolve_db(x_sap_db)
+
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT h.empID, "
+                "       LTRIM(RTRIM(ISNULL(h.firstName,'') + ' ' + ISNULL(h.lastName,''))) AS nombre, "
+                "       u.USER_CODE AS userCode, "
+                "       ISNULL(b.Name,'') AS sucursal "
+                "FROM   OHEM h "
+                "       JOIN OUSR u ON u.USERID = h.userId "
+                "       LEFT JOIN OUBR b ON b.Code = h.branch "
+                "WHERE  ISNULL(h.Active,'Y')='Y' "
+                "  AND  h.userId IS NOT NULL AND h.userId <> -1 "
+                "ORDER BY sucursal, nombre"
+            )
+            empleados = [
+                {
+                    "empId":    int(r.empID),
+                    "userCode": (r.userCode or "").strip(),
+                    "name":     (r.nombre or "").strip() or f"#{r.empID}",
+                    "sucursal": (r.sucursal or "").strip(),
+                }
+                for r in cursor.fetchall()
+                if (r.userCode or "").strip()
+            ]
+            return {"success": True, "empleados": empleados}
         finally:
             cursor.close()
             conn.close()
