@@ -157,6 +157,31 @@ def _has_images_col(cursor, database: str) -> bool:
     return exists
 
 
+NAME_COL = "U_Name"
+
+# La columna Name de toda UDT tiene índice ÚNICO en SAP; Shopify repite el
+# título entre variantes (misma prenda, otra talla/color). Por eso el título
+# vive en U_Name (sin únicos) y Name guarda el SKU (único por definición).
+_NAME_COL_CACHE: Dict[str, bool] = {}
+
+
+def _has_name_col(cursor, database: str) -> bool:
+    """¿Existe la columna U_Name (título sin únicos) en [@SHOPIFY_ARTICLE]?"""
+    if database in _NAME_COL_CACHE:
+        return _NAME_COL_CACHE[database]
+    try:
+        cursor.execute(
+            "SELECT 1 FROM sys.columns "
+            "WHERE object_id = OBJECT_ID('[@SHOPIFY_ARTICLE]') AND name = ?",
+            [NAME_COL],
+        )
+        exists = cursor.fetchone() is not None
+    except pyodbc.Error:
+        exists = False
+    _NAME_COL_CACHE[database] = exists
+    return exists
+
+
 BODY_COL = "U_Body"
 
 # Cache de existencia de la columna U_Body por base (igual que U_Imagenes).
@@ -189,7 +214,6 @@ def _parse_images(raw: Optional[str]) -> list:
 
 _ARTICLES_BASE_COLS = """
         Code         AS ItemCode,
-        Name         AS ItemName,
         U_Activo     AS Activo,
         U_Vendor     AS Vendor,
         U_Type       AS ProductType,
@@ -202,11 +226,14 @@ _ARTICLES_BASE_COLS = """
 """
 
 
-def _articles_select(has_img: bool, has_body: bool = False) -> str:
-    """SELECT de artículos; incluye imágenes/body solo si sus columnas existen."""
+def _articles_select(has_img: bool, has_body: bool = False, has_name: bool = False) -> str:
+    """SELECT de artículos; incluye imágenes/body solo si sus columnas existen.
+    El nombre visible sale de U_Name y cae a Name para filas legado."""
+    name_expr = "ISNULL(U_Name, Name)" if has_name else "Name"
     img  = ",\n        U_Imagenes AS ImagesRaw" if has_img else ""
     body = ",\n        U_Body     AS BodyRaw" if has_body else ""
-    return f"SELECT {_ARTICLES_BASE_COLS}{img}{body}\n    FROM [@SHOPIFY_ARTICLE]"
+    return (f"SELECT {_ARTICLES_BASE_COLS},\n        {name_expr} AS ItemName{img}{body}"
+            f"\n    FROM [@SHOPIFY_ARTICLE]")
 
 
 def _activo_to_status(flag: Optional[str]) -> str:
@@ -261,7 +288,8 @@ def get_articles(
         try:
             has_img  = _has_images_col(cursor, database)
             has_body = _has_body_col(cursor, database)
-            select   = _articles_select(has_img, has_body)
+            has_name = _has_name_col(cursor, database)
+            select   = _articles_select(has_img, has_body, has_name)
 
             # ── Caso 1: un solo ItemCode ─────────────────────────────────────
             # Devolvemos el item EXISTA O NO sea activo — el campo Status
@@ -327,7 +355,7 @@ class ArticleIn(BaseModel):
     - El resto opcional — cualquier campo `None` no se toca en UPDATE
     """
     code:       Optional[str] = PydField(None, max_length=50)
-    name:       Optional[str] = PydField(None, max_length=100)
+    name:       Optional[str] = PydField(None, max_length=200)
     vendor:     Optional[str] = PydField(None, max_length=100)
     type:       Optional[str] = PydField(None, max_length=100)
     opt1Name:   Optional[str] = PydField(None, max_length=50)
@@ -378,7 +406,8 @@ def create_article(
                     "U_Opt3Name", "U_Opt3Value", "U_Activo"]
             vals = [
                 payload.code,
-                payload.name      or None,
+                # Name (índice ÚNICO de SAP) = SKU; el título visible va en U_Name.
+                payload.code,
                 payload.vendor    or None,
                 payload.type      or None,
                 payload.opt1Name  or None,
@@ -398,6 +427,11 @@ def create_article(
             if _has_body_col(cursor, database):
                 cols.append(BODY_COL)
                 vals.append(payload.body or None)
+
+            # Título del producto (U_Name, permite duplicados entre variantes)
+            if _has_name_col(cursor, database):
+                cols.append(NAME_COL)
+                vals.append(payload.name or None)
 
             placeholders = ", ".join("?" * len(cols))
             cursor.execute(
@@ -436,8 +470,11 @@ def update_article(
             # Construir SET dinámico: solo campos NO-None
             sets:   list[str] = []
             params: list[Any] = []
+            # El título va a U_Name (sin únicos); si la base no tuviera la
+            # columna, cae al comportamiento anterior (Name, con únicos).
+            name_target = NAME_COL if _has_name_col(cursor, database) else "Name"
             mapping = [
-                ("Name",        payload.name),
+                (name_target,   payload.name),
                 ("U_Vendor",    payload.vendor),
                 ("U_Type",      payload.type),
                 ("U_Opt1Name",  payload.opt1Name),
