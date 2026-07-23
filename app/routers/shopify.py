@@ -298,10 +298,9 @@ def get_articles(
                 cursor.execute(select + " WHERE Code = ?", [itemCode])
                 row = cursor.fetchone()
                 if not row:
-                    return err(
-                        404,
-                        f"ItemCode '{itemCode}' no existe en @SHOPIFY_ARTICLE.",
-                    )
+                    # Búsqueda sin coincidencia → lista vacía (el portal muestra
+                    # "sin resultados"; un 404 aquí pintaba un error de carga).
+                    return {"success": True, "message": None, "articles": {}}
                 return {
                     "success":  True,
                     "message":  None,
