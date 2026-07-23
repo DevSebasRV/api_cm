@@ -157,6 +157,29 @@ def _has_images_col(cursor, database: str) -> bool:
     return exists
 
 
+BODY_COL = "U_Body"
+
+# Cache de existencia de la columna U_Body por base (igual que U_Imagenes).
+_BODY_COL_CACHE: Dict[str, bool] = {}
+
+
+def _has_body_col(cursor, database: str) -> bool:
+    """¿Existe la columna U_Body (HTML del producto) en [@SHOPIFY_ARTICLE]?"""
+    if database in _BODY_COL_CACHE:
+        return _BODY_COL_CACHE[database]
+    try:
+        cursor.execute(
+            "SELECT 1 FROM sys.columns "
+            "WHERE object_id = OBJECT_ID('[@SHOPIFY_ARTICLE]') AND name = ?",
+            [BODY_COL],
+        )
+        exists = cursor.fetchone() is not None
+    except pyodbc.Error:
+        exists = False
+    _BODY_COL_CACHE[database] = exists
+    return exists
+
+
 def _parse_images(raw: Optional[str]) -> list:
     """Texto del UDF (una URL por línea) → lista de URLs limpias (sin vacías)."""
     if not raw:
@@ -179,10 +202,11 @@ _ARTICLES_BASE_COLS = """
 """
 
 
-def _articles_select(has_img: bool) -> str:
-    """SELECT de artículos; incluye la columna de imágenes solo si existe."""
-    img = ",\n        U_Imagenes AS ImagesRaw" if has_img else ""
-    return f"SELECT {_ARTICLES_BASE_COLS}{img}\n    FROM [@SHOPIFY_ARTICLE]"
+def _articles_select(has_img: bool, has_body: bool = False) -> str:
+    """SELECT de artículos; incluye imágenes/body solo si sus columnas existen."""
+    img  = ",\n        U_Imagenes AS ImagesRaw" if has_img else ""
+    body = ",\n        U_Body     AS BodyRaw" if has_body else ""
+    return f"SELECT {_ARTICLES_BASE_COLS}{img}{body}\n    FROM [@SHOPIFY_ARTICLE]"
 
 
 def _activo_to_status(flag: Optional[str]) -> str:
@@ -190,7 +214,7 @@ def _activo_to_status(flag: Optional[str]) -> str:
     return "Activa" if (flag or "Y").strip().upper() == "Y" else "Inactiva"
 
 
-def _build_article(row, has_img: bool) -> Dict[str, Any]:
+def _build_article(row, has_img: bool, has_body: bool = False) -> Dict[str, Any]:
     """
     Toda la data sale de la UDT @SHOPIFY_ARTICLE.
     Las llaves van sin espacios (Option1Name en vez de "Option1 Name") para
@@ -213,6 +237,8 @@ def _build_article(row, has_img: bool) -> Dict[str, Any]:
         "Option3Value":  row.Opt3Value,
         # Siempre array: vacío si la base no tiene el UDF o el artículo no tiene imágenes.
         "Images":        _parse_images(row.ImagesRaw) if has_img else [],
+        # HTML del producto (U_Body, tipo Memo). Se guarda y devuelve TAL CUAL.
+        "Body":          (row.BodyRaw if has_body else None),
     }
     return art
 
@@ -233,8 +259,9 @@ def get_articles(
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
-            has_img = _has_images_col(cursor, database)
-            select  = _articles_select(has_img)
+            has_img  = _has_images_col(cursor, database)
+            has_body = _has_body_col(cursor, database)
+            select   = _articles_select(has_img, has_body)
 
             # ── Caso 1: un solo ItemCode ─────────────────────────────────────
             # Devolvemos el item EXISTA O NO sea activo — el campo Status
@@ -312,6 +339,9 @@ class ArticleIn(BaseModel):
     activo:     Optional[str] = PydField(None, pattern=r"^[YN]$")
     # URLs de imágenes. None = no tocar (en update); [] = limpiar.
     imagenes:   Optional[List[str]] = PydField(None)
+    # HTML del producto (descripción larga). Sin límite de largo (UDF Memo).
+    # None = no tocar (en update); "" = limpiar.
+    body:       Optional[str] = PydField(None)
 
 
 def _join_images(urls: Optional[List[str]]) -> Optional[str]:
@@ -363,6 +393,11 @@ def create_article(
             if _has_images_col(cursor, database):
                 cols.append(IMAGES_COL)
                 vals.append(_join_images(payload.imagenes))
+
+            # Body (HTML): tal cual, sin transformar — solo si el UDF existe
+            if _has_body_col(cursor, database):
+                cols.append(BODY_COL)
+                vals.append(payload.body or None)
 
             placeholders = ", ".join("?" * len(cols))
             cursor.execute(
@@ -423,6 +458,11 @@ def update_article(
             if payload.imagenes is not None and _has_images_col(cursor, database):
                 sets.append(f"{IMAGES_COL} = ?")
                 params.append(_join_images(payload.imagenes))
+
+            # Body (HTML): None = no tocar; "" = limpiar; texto = guardar tal cual
+            if payload.body is not None and _has_body_col(cursor, database):
+                sets.append(f"{BODY_COL} = ?")
+                params.append(payload.body if payload.body != "" else None)
 
             if not sets:
                 return err(400, "No se mandó ningún campo para actualizar.")
