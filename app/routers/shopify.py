@@ -277,7 +277,7 @@ def get_articles(
                 return {
                     "success":  True,
                     "message":  None,
-                    "articles": { row.ItemCode: _build_article(row, has_img) },
+                    "articles": { row.ItemCode: _build_article(row, has_img, has_body) },
                 }
 
             # ── Caso 2: listado paginado (activos + inactivos) ─────────────
@@ -291,7 +291,7 @@ def get_articles(
                 [offset, pageSize],
             )
             articles = {
-                row.ItemCode: _build_article(row, has_img)
+                row.ItemCode: _build_article(row, has_img, has_body)
                 for row in cursor.fetchall()
             }
 
