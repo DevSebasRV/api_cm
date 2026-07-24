@@ -129,7 +129,14 @@ _ODS_SELECT = """
         T4.[Name]                                       AS orderType,     -- 14
         T0.status                                       AS [status],      -- 15
         ''                                              AS total,         -- 16
-        T4.[Name]                                       AS serviceType    -- 17
+        T4.[Name]                                       AS serviceType,   -- 17
+        -- Campos personalizables de CM (se agregan AL FINAL para no mover
+        -- los índices 0-17 que usa _build_order_json):
+        T1.Address                                      AS custAddress,   -- 18
+        T1.ZipCode                                      AS custZip,       -- 19
+        T1.LicTradNum                                   AS custRfc,       -- 20
+        T0.manufSN                                      AS engineNum,     -- 21
+        T3.U_Ps_Color                                   AS vehColor       -- 22
     FROM OSCL T0
         LEFT JOIN OCRD T1 ON T0.customer   = T1.CardCode
         LEFT JOIN OINS T3 ON T0.insID      = T3.insID
@@ -298,6 +305,28 @@ def create_cm_order(
     # lo mandamos como None en vez de romper toda la orden.
     payload["year"] = _to_int_or_none(payload.get("year"))
 
+    # ── Campos personalizables de CM (formato confirmado por su soporte) ─────
+    # Requieren `type` + nombre EXACTO como está configurado en cada taller.
+    # Solo se mandan los que traen valor. "Numero de Serie" duplica el vin
+    # (así lo pide la pantalla de CM: campo del formulario + atributo vin).
+    def _cf(name: str, value, seccion: str):
+        v = "" if value is None else str(value).strip()
+        if not v:
+            return None
+        return {"type": "FreeText", "name": name, "value": v, "fieldSection": seccion}
+
+    row0 = rows[0]
+    cfs = [c for c in (
+        _cf("Dirección",       row0[18],           "WebCustomerInfo"),
+        _cf("Codigo Postal",   row0[19],           "WebCustomerInfo"),
+        _cf("RFC",             row0[20],           "WebCustomerInfo"),
+        _cf("Numero de Serie", payload.get("vin"), "WebVehicleInfo"),
+        _cf("Numero de Motor", row0[21],           "WebVehicleInfo"),
+        _cf("Color",           row0[22],           "WebVehicleInfo"),
+    ) if c]
+    if cfs:
+        payload["customizableFields"] = cfs
+
     # ── 2. Login en CM ───────────────────────────────────────────────────────
     token = _cm_login()
     if not token:
@@ -308,6 +337,33 @@ def create_cm_order(
     status, body = _http_post_json(
         url, payload, {"Authorization": f"Bearer {token}"}
     )
+
+    # Respaldo: si el taller no tiene configurado alguno de los campos
+    # personalizables, CM rechaza TODA la orden ("Field X not found in CMOS").
+    # Se quita SOLO el campo rechazado y se reintenta (los demás sí llegan);
+    # si el error no identifica el campo, se reintenta sin ninguno.
+    # (Verificado: 2948 no tiene "Dirección"; 2947/4105/4104 tienen los 6.)
+    intentos = 0
+    while status not in (200, 201) and payload.get("customizableFields") and intentos < 4:
+        detalle = str(body)
+        m = re.search(r"Field\s+(.+?)\s+not found", detalle)
+        if m:
+            malo = m.group(1).strip()
+            restantes = [c for c in payload["customizableFields"] if c["name"] != malo]
+            if len(restantes) == len(payload["customizableFields"]):
+                restantes = []          # el nombre no matcheó → quitar todos
+        elif "custom" in detalle.lower():
+            restantes = []
+        else:
+            break                       # error ajeno a los campos → no reintentar
+        if restantes:
+            payload["customizableFields"] = restantes
+        else:
+            payload.pop("customizableFields", None)
+        print(f"[CM] Campo personalizable rechazado por el taller {repairShopId}; "
+              f"reintentando. Detalle: {detalle[:160]}")
+        status, body = _http_post_json(url, payload, {"Authorization": f"Bearer {token}"})
+        intentos += 1
 
     if status in (200, 201):
         # CM responde 201 Created en éxito. Devuelve algo con un id si viene.
