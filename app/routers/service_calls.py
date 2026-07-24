@@ -93,7 +93,9 @@ _LIST_SELECT = """
             OSCL.createDate,
             OSCL.createTime,
             OSCL.closeDate,
-            OHEM.firstName + ISNULL(' ' + OHEM.lastName, '') AS Tecnico,
+            -- OSCL.assignee es un USUARIO (OUSR.USERID) = el MECÁNICO real.
+            -- (Verificado contra el formulario de SAP: campo "Mecánico".)
+            OUSR.U_NAME         AS Tecnico,
             OINS.U_Ps_Marca     AS MotoMarca,
             OINS.U_Ps_SubMarca  AS MotoSubMarca,
             OINS.U_Ps_Modelo    AS MotoModelo,
@@ -102,7 +104,7 @@ _LIST_SELECT = """
     LEFT    JOIN OCRD ON OCRD.CardCode  = OSCL.customer
     LEFT    JOIN OITM ON OITM.ItemCode  = OSCL.itemCode
     LEFT    JOIN OSCS ON OSCS.statusID  = OSCL.status
-    LEFT    JOIN OHEM ON OHEM.empID     = OSCL.assignee
+    LEFT    JOIN OUSR ON OUSR.USERID    = OSCL.assignee
     LEFT    JOIN OINS ON OINS.insID     = OSCL.insID
 """
 
@@ -182,12 +184,12 @@ def list_service_calls(
             where_parts.append(clause)
             params += params_w
 
-    # Sucursal: la ODS no trae sucursal propia (verificado: OSCL solo tiene la
-    # serie, que codifica MARCA); se usa la sucursal del ASESOR asignado.
-    # Órdenes sin asesor o con asesor sin sucursal quedan fuera del filtro.
+    # Sucursal: la ODS no trae sucursal propia; se usa la sucursal del ASESOR
+    # DE SERVICIO, que en este SAP vive en OSCL.technician (empleado OHEM).
+    # (OSCL.assignee es el MECÁNICO como usuario OUSR — no sirve para sucursal.)
     if sucursal and sucursal.strip():
         where_parts.append(
-            "OSCL.assignee IN (SELECT h.empID FROM OHEM h "
+            "OSCL.technician IN (SELECT h.empID FROM OHEM h "
             "JOIN OUBR b ON b.Code = h.branch WHERE b.Name = ?)"
         )
         params.append(sucursal.strip())
@@ -259,7 +261,7 @@ def list_service_call_statuses(
             join_suc = ""
             qparams: List[Any] = []
             if sucursal and sucursal.strip():
-                join_suc = (" AND OSCL.assignee IN (SELECT h.empID FROM OHEM h "
+                join_suc = (" AND OSCL.technician IN (SELECT h.empID FROM OHEM h "
                             "JOIN OUBR b ON b.Code = h.branch WHERE b.Name = ?)")
                 qparams = [sucursal.strip()]
             cursor.execute(
@@ -322,7 +324,7 @@ _DETAIL_HEADER = """
             OSCS.Name            AS StatusName,
             OSCO.Name            AS OrigenName,
             OSCP.Name            AS ProblemName,
-            OHEM.firstName + ISNULL(' ' + OHEM.lastName, '') AS TecnicoName,
+            OUSR.U_NAME          AS TecnicoName,
             OINS.manufSN         AS EquipManufSN,
             OINS.internalSN      AS EquipInternalSN,
             OINS.U_Ps_Marca      AS EquipMarca,
@@ -336,7 +338,7 @@ _DETAIL_HEADER = """
     LEFT    JOIN OSCS ON OSCS.statusID    = OSCL.status
     LEFT    JOIN OSCO ON OSCO.originID    = OSCL.origin
     LEFT    JOIN OSCP ON OSCP.prblmTypID  = OSCL.problemTyp
-    LEFT    JOIN OHEM ON OHEM.empID       = OSCL.assignee
+    LEFT    JOIN OUSR ON OUSR.USERID      = OSCL.assignee
     LEFT    JOIN OINS ON OINS.insID       = OSCL.insID
     LEFT    JOIN OITM ON OITM.ItemCode    = OSCL.itemCode
     WHERE   OSCL.callID = ?
@@ -1006,8 +1008,9 @@ def validate_service_call_codes(
     checks = [
         ("cardCode",    cardCode,    "OCRD", "CardCode",   "Cliente"),
         ("itemCode",    itemCode,    "OITM", "ItemCode",   "Artículo (SKU)"),
-        ("assignee",    assignee,    "OHEM", "empID",      "Asesor de servicio"),
-        ("technician",  technician,  "OHEM", "empID",      "Técnico"),
+        # assignee = usuario OUSR (Mecánico); technician = empleado OHEM (Asesor).
+        ("assignee",    assignee,    "OUSR", "USERID",     "Mecánico"),
+        ("technician",  technician,  "OHEM", "empID",      "Asesor de servicio"),
         ("origin",      origin,      "OSCO", "originID",   "Origen"),
         ("problemType", problemType, "OSCP", "prblmTypID", "Tipo de problema"),
     ]
@@ -1130,13 +1133,30 @@ def get_catalogs(
                     ]
                 except pyodbc.Error:
                     techs = emps   # fallback: si falla, no bloqueamos
-                return emps, techs
 
-            employees, technicians = _fetch_people(branch_codes)
+                # Mecánicos = USUARIOS (OUSR) con empleado activo — es lo que
+                # SAP guarda en OSCL.assignee (campo "Mecánico" del formulario).
+                try:
+                    cursor.execute(
+                        "SELECT DISTINCT u.USERID, u.U_NAME "
+                        "FROM   OUSR u JOIN OHEM h ON h.userId = u.USERID "
+                        "WHERE  ISNULL(h.Active,'Y')='Y' " + where_branch.replace("h.branch", "h.branch") +
+                        "ORDER BY u.U_NAME",
+                        params,
+                    )
+                    mecs = [
+                        {"id": int(r.USERID), "name": (r.U_NAME or f"#{r.USERID}").strip()}
+                        for r in cursor.fetchall()
+                    ]
+                except pyodbc.Error:
+                    mecs = []
+                return emps, techs, mecs
+
+            employees, technicians, mecanicos = _fetch_people(branch_codes)
             # Si el filtro por sucursal dejó la lista vacía (sucursal sin
             # empleados en esta base), caemos a la lista completa.
             if branch_codes and not employees:
-                employees, technicians = _fetch_people([])
+                employees, technicians, mecanicos = _fetch_people([])
 
             # Series para ServiceCalls (ObjectCode=191)
             try:
@@ -1155,6 +1175,12 @@ def get_catalogs(
                 "origins":   origins,
                 "problems":  problems,
                 "statuses":  statuses,
+                # Semántica REAL de este SAP (verificada contra su formulario):
+                #   asesores  → OSCL.technician (empleado OHEM, "Asesor de Servicio")
+                #   mecanicos → OSCL.assignee   (usuario OUSR,  "Mecánico")
+                "asesores":  technicians,
+                "mecanicos": mecanicos,
+                # Legacy (portal viejo): se mantienen mientras convive el deploy.
                 "employees": employees,
                 "technicians": technicians,
                 "series":    series,
