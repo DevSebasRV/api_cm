@@ -19,11 +19,15 @@ app/
     ├── common.py            # helpers compartidos: resolve_db, err, _pagination
     ├── inventory.py         # /inventoryItems (formato ClearMechanic)
     ├── business_partners.py # /businessPartners* (búsqueda, RFC, nextCode, detalle)
-    ├── service_calls.py     # /serviceCalls*, catálogos, stock, kits, seriales
-    ├── clearmechanic.py     # /clearmechanic/* (órdenes, citas, inspecciones)
+    ├── service_calls.py     # /serviceCalls* (listado/detalle/filtro por sucursal),
+    │                        #   catálogos de alta (asesores/mecánicos), stock,
+    │                        #   kits, seriales, códigos de usuario
+    ├── clearmechanic.py     # /clearmechanic/* (órdenes con campos del formulario
+    │                        #   de CM, citas, inspecciones y sus estimates)
     ├── cfdi_reconcile.py    # /cfdiReconcile (CFDIs recibidos vs OPCH)
     ├── destajo.py           # /destajo, /destajoTecnicos (SP de nómina)
-    └── shopify.py           # /shopify/* (artículos, stock, precios) — con API key
+    └── shopify.py           # /shopify/* (artículos con título/HTML/imágenes,
+                             #   stock, precios) — con API key
 run.py                   # dev: uvicorn con reload (puerto 8000)
 ```
 
@@ -39,6 +43,10 @@ run.py                   # dev: uvicorn con reload (puerto 8000)
 - **Conexiones**: cerrar cursor/conexión en `try/finally`.
 - **Auth**: `/shopify/*` exige `X-API-Key` (llaves en `.env`). El resto de la
   API es de red interna, detrás del reverse proxy.
+- **Asignaciones de órdenes de servicio (no intuitivo)**: en este SAP,
+  `OSCL.assignee` guarda un **usuario** (el Mecánico del formulario) y
+  `OSCL.technician` un **empleado** (el Asesor de Servicio). El código ya
+  respeta esa semántica — no "corregirla" por el nombre de la columna.
 - Español en comentarios, mensajes y commits.
 
 ## Desarrollo
