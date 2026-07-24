@@ -550,16 +550,24 @@ def _fetch_related_documents(
     close_date:  Optional[Any],
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Busca documentos relacionados con la orden de servicio combinando dos
-    mecanismos:
+    Busca documentos REALMENTE ligados a la orden de servicio, combinando:
 
-    1.  Linkage estándar SAP B1 — busca líneas en QUT1/RDR1/DLN1/INV1 con
-        BaseType=191 y BaseEntry=CallID. Funciona cuando se crearon los docs
-        directamente desde la pestaña "Registr y Refacciones" de SAP.
+    1.  Linkage estándar SAP B1 — líneas en QUT1/RDR1/DLN1/INV1 con
+        BaseType=191 y BaseEntry=CallID (docs creados desde la pestaña
+        "Registr y Refacciones" de SAP).
 
-    2.  Heurística por cliente + fechas — si el linkage estándar no encuentra
-        nada (caso típico en Ferbel donde los docs se crean por otros flujos),
-        busca docs del MISMO cliente con DocDate entre createDate y closeDate.
+    2.  SCL4 — la grilla de documentos de "Registr y Refacciones"
+        (SrcvCallID → Object + DocAbs). La llena el portal vía
+        ServiceCallInventoryExpenses y también SAP al ligar a mano.
+
+    3.  Marcador del portal "ODS #<callId>" en Comments (respaldo para docs
+        del portal cuya liga haya fallado o anteriores a la liga).
+
+    NOTA: existió una "heurística por cliente + fechas" que listaba TODOS los
+    documentos del cliente en el rango de la orden — con clientes de mucho
+    movimiento (p.ej. intercompañía) inventaba decenas de relaciones falsas.
+    Se eliminó a propósito: aquí solo entran ligas verificables.
+    (card_code y close_date ya no se usan; se conservan por compatibilidad.)
 
     Los documentos se devuelven sin duplicados (vía set de (obj_type, doc_entry)).
     """
@@ -601,41 +609,38 @@ def _fetch_related_documents(
         except pyodbc.Error:
             pass
 
-    # ── Mecanismo 2: Heurística por cliente + fechas ────────────────────────
-    if card_code and create_date is not None:
-        # Orden cerrada → hasta su fecha de cierre. Orden ABIERTA → hasta HOY,
-        # para que las ofertas creadas después (ej. desde el portal) aparezcan.
-        date_to = close_date if close_date is not None else datetime.date.today()
-
-        for obj_type, _, head_table, type_label in doc_specs:
+    # ── Mecanismo 2: SCL4 — documentos ligados a la llamada ─────────────────
+    # (La grilla de "Registr y Refacciones": Object = tipo, DocAbs = DocEntry.)
+    _label_by_obj = {23: "Oferta", 17: "Pedido", 15: "Entrega", 13: "Factura"}
+    try:
+        cursor.execute(
+            "SELECT DISTINCT Object, DocAbs FROM SCL4 "
+            "WHERE SrcvCallID = ? AND DocAbs IS NOT NULL",
+            [call_id],
+        )
+        for r in cursor.fetchall():
             try:
-                cursor.execute(
-                    f"""
-                    SELECT DocEntry
-                    FROM   {head_table}
-                    WHERE  CardCode = ?
-                      AND  DocDate >= ?
-                      AND  DocDate <= ?
-                    ORDER BY DocEntry
-                    """,
-                    [card_code, create_date, date_to],
-                )
-                for r in cursor.fetchall():
-                    key = (obj_type, int(r.DocEntry))
-                    if key in seen:
-                        continue
-                    doc = _fetch_document(cursor, obj_type, int(r.DocEntry))
-                    if doc:
-                        grouped[type_label].append(doc)
-                        seen.add(key)
-            except pyodbc.Error:
-                pass
+                obj_type = int(str(r.Object).strip())
+            except (TypeError, ValueError):
+                continue
+            type_label = _label_by_obj.get(obj_type)
+            if not type_label:
+                continue
+            key = (obj_type, int(r.DocAbs))
+            if key in seen:
+                continue
+            doc = _fetch_document(cursor, obj_type, int(r.DocAbs))
+            if doc:
+                grouped[type_label].append(doc)
+                seen.add(key)
+    except pyodbc.Error:
+        pass
 
     # ── Mecanismo 3: marcador del portal en Comments ("ODS #<callId>") ───────
     # Determinístico para documentos creados desde el portal. NO depende de
     # fechas, así que liga las ofertas aunque la orden ya tenga closeDate y el
-    # documento se haya creado DESPUÉS de esa fecha (caso que la heurística por
-    # rango de fechas se perdía). El marcador lo estampa create-quote-action.
+    # documento se haya creado DESPUÉS de esa fecha. Lo estampan las acciones
+    # del portal (crear oferta, convertir a entrega) en Comments.
     marker_like = f"%ODS #{call_id}%"
     # Evita que, p.ej., la orden 7006 capture documentos de la 70065.
     marker_re = re.compile(rf"ODS\s*#?\s*{call_id}(?:\D|$)")
