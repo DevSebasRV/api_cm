@@ -26,9 +26,11 @@ import urllib.error
 import urllib.parse
 import pyodbc
 
+from concurrent.futures import ThreadPoolExecutor
+
 from app.config import EMPRESAS, CM_LOGIN_URL, CM_ORDERS_URL, CM_USER, CM_PASSWORD
 from app.database import get_connection
-from app.routers.common import err
+from app.routers.common import err, resolve_db
 
 router = APIRouter(prefix="/clearmechanic", tags=["ClearMechanic"])
 
@@ -1267,3 +1269,144 @@ def list_cm_custom_reasons(repairShopId: int):
             ],
         })
     return {"success": True, "message": None, "data": {"reasons": reasons}}
+
+
+# Caché en memoria de contadores de inspección por (taller, folio) — ver _check.
+_INSP_ALERT_CACHE: dict = {}
+_INSP_ALERT_CACHE_TTL = 90.0
+
+
+@router.get(
+    "/inspectionAlerts",
+    summary="ODS abiertas del asesor con puntos de inspección Rojo/Amarillo en CM",
+)
+def inspection_alerts(
+    repairShopId: int,
+    userCode: Optional[str] = None,
+    sucursal: Optional[str] = None,
+    limit: int = 40,
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Para la tarjeta de Inicio del portal: toma las ODS ABIERTAS (closeDate NULL)
+    del asesor (OSCL.technician = su empID, resuelto vía userCode→OUSR→OHEM;
+    si no hay userCode se filtra por sucursal, y sin ninguno se toman las más
+    recientes) y consulta en CM el detalle de cada una (en paralelo) para
+    devolver SOLO las que tienen puntos de inspección Amarillos o Rojos.
+
+    El folio de CM = CallID de SAP. Órdenes que no existen en CM se omiten.
+    """
+    if not CM_USER or not CM_PASSWORD:
+        return err(500, "ClearMechanic no está configurado (faltan CM_USER / CM_PASSWORD en .env).")
+
+    _, database = resolve_db(x_sap_db)
+    limit = max(1, min(int(limit), 60))
+
+    # ── 1) ODS abiertas del asesor en SAP ───────────────────────────────────
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            emp_id = None
+            if userCode:
+                cursor.execute(
+                    "SELECT TOP 1 h.empID FROM OHEM h "
+                    "JOIN OUSR u ON u.USERID = h.userId "
+                    "WHERE u.USER_CODE = ? AND ISNULL(h.Active,'Y') = 'Y'",
+                    [userCode],
+                )
+                row = cursor.fetchone()
+                emp_id = int(row.empID) if row else None
+
+            where  = "WHERE closeDate IS NULL"
+            params: list = []
+            if emp_id is not None:
+                where += " AND technician = ?"
+                params.append(emp_id)
+            elif sucursal:
+                where += (" AND technician IN (SELECT h.empID FROM OHEM h "
+                          "JOIN OUBR b ON b.Code = h.branch WHERE b.Name = ?)")
+                params.append(sucursal)
+
+            cursor.execute(
+                f"SELECT TOP {limit} callID, customer, custmrName "
+                f"FROM OSCL {where} ORDER BY callID DESC",
+                params,
+            )
+            ods = [
+                {"callId": int(r.callID),
+                 "customer": (r.customer or "").strip(),
+                 "customerName": (r.custmrName or "").strip()}
+                for r in cursor.fetchall()
+            ]
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+
+    if not ods:
+        return {"success": True, "message": None,
+                "data": {"alerts": [], "checked": 0}}
+
+    # ── 2) Contadores de inspección por orden en CM (en paralelo) ───────────
+    token = _cm_login()
+    if not token:
+        return err(502, "No se pudo autenticar en ClearMechanic.")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def _check(o):
+        # Caché de 90s por (taller, folio): CM limita la tasa de peticiones
+        # (HTTP 429) y varios asesores recargando el Inicio la agotarían.
+        key = (int(repairShopId), o["callId"])
+        now = time.time()
+        hit = _INSP_ALERT_CACHE.get(key)
+        if hit and now - hit[0] < _INSP_ALERT_CACHE_TTL:
+            base = hit[1]
+            return {**o, **base} if base else None
+
+        url = f"{CM_ORDERS_URL}/{o['callId']}?repairShopId={int(repairShopId)}"
+        status, body = _http_get_json(url, headers)
+        if status == 429:                     # límite de tasa de CM → un reintento
+            time.sleep(1.5)
+            status, body = _http_get_json(url, headers)
+        if status == 404:                     # la orden no existe en CM
+            _INSP_ALERT_CACHE[key] = (now, None)
+            return None
+        if status != 200:                     # error puntual: no cachear
+            return None
+        try:
+            data = json.loads(body).get("data", {}) or {}
+        except Exception:
+            return None
+        yellow = int(data.get("yellowItemsCount") or 0)
+        red    = int(data.get("redItemsCount") or 0)
+        if yellow + red == 0:
+            _INSP_ALERT_CACHE[key] = (now, None)
+            return None
+        points = []
+        for it in (data.get("inspectionItems") or []):
+            if not isinstance(it, dict):
+                continue
+            pr = (it.get("priority") or "").strip()
+            if pr == "Urgent":
+                color = "rojo"
+            elif pr == "Med":
+                color = "amarillo"
+            else:
+                continue
+            points.append({"name": (it.get("inspectionItemName") or "").strip(),
+                           "color": color})
+        base = {"yellow": yellow, "red": red, "points": points,
+                "lastUpdatedTime": data.get("lastUpdatedTime")}
+        _INSP_ALERT_CACHE[key] = (now, base)
+        return {**o, **base}
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(_check, ods))
+
+    alerts = [a for a in results if a]
+    alerts.sort(key=lambda a: a.get("lastUpdatedTime") or "", reverse=True)
+
+    return {"success": True, "message": None,
+            "data": {"alerts": alerts, "checked": len(ods)}}
