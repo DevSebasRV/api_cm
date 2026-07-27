@@ -985,7 +985,9 @@ def list_cm_appointments(
 )
 def create_cm_appointment(
     repairShopId:     int           = Body(..., embed=True),
-    startDate:        str           = Body(..., embed=True, description="ISO 8601, ej. 2026-07-10T15:30:00Z"),
+    startDate:        str           = Body(..., embed=True,
+                                           description="HORA LOCAL del taller, ej. 2026-07-10T15:30:00 "
+                                                       "(CM ignora la Z: no mandar UTC)"),
     customer:         dict          = Body(..., embed=True, description="{firstName, mobile, lastName?, email?}"),
     vehicle:          dict          = Body(default={}, embed=True, description="{brand,model,year,vin,licensePlate,color}"),
     customReasons:    list          = Body(default=[], embed=True,
@@ -1000,7 +1002,12 @@ def create_cm_appointment(
     """POST /cm/v2/appointments?workshopId=<GUID>. V2 acepta cliente y vehículo
     inline (no hay que pre-crear customer/vehicle). serviceAdvisorId y motivos son
     opcionales. Si viene orderNumber se estampa como 'ODS #<n>' en observations
-    (V2 no tiene campo orderNumber para ligar a la orden SAP)."""
+    (V2 no tiene campo orderNumber para ligar a la orden SAP).
+
+    ⚠️ startDate: CM lo interpreta como HORA LOCAL del taller e IGNORA el sufijo
+    Z (verificado 2026-07-27 creando "15:30:00" → la lista la regresa 21:30Z =
+    15:30 CDMX). Mandar hora local sin convertir a UTC; el GET de citas, en
+    cambio, SÍ devuelve UTC real."""
     if not CM_USER or not CM_PASSWORD:
         return err(500, "ClearMechanic no está configurado.")
     guid = _WORKSHOP_GUID_BY_SHOP.get(int(repairShopId))
@@ -1093,12 +1100,11 @@ def create_cm_appointment(
         detail = parsed.get("message") or (parsed.get("data") or {}).get("message") or resp
     except Exception:
         pass
-    # 409: CM no encontró asesor disponible para ese horario (fin de semana, fuera
-    # de 9-18, o todos ocupados). Elegir asesor explícito NO lo evita (CM valida la
-    # agenda igual). Damos un mensaje accionable.
+    # 409: CM no encontró asesor con agenda para ese horario (fin de semana, fuera
+    # del horario del taller, o todos ocupados). Elegir asesor explícito NO lo
+    # evita (CM valida la agenda igual). El horario exacto varía por taller.
     if st == 409 or "No available service advisor" in str(detail):
-        return err(409, "No hay asesor disponible en ese horario. Los asesores atienden "
-                        "de lunes a viernes, 9:00 a 18:00. Elige otra fecha y hora.")
+        return err(409, "No hay asesor con agenda en ese horario. Elige otra hora o fecha.")
     return err(502, f"ClearMechanic rechazó la cita (HTTP {st}): {detail}", {"sentPayload": payload})
 
 
