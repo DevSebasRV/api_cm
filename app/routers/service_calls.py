@@ -487,12 +487,14 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
 
     cursor.execute(
         f"""
-        SELECT  LineNum, ItemCode, Dscription, Quantity, Price, LineTotal,
-                VatSum, VatPrcnt, PriceAfVAT, GTotal,
-                LineStatus, WhsCode, TargetType, TrgetEntry
-        FROM    {l_table}
-        WHERE   DocEntry = ?
-        ORDER BY LineNum
+        SELECT  L.LineNum, L.ItemCode, L.Dscription, L.Quantity, L.Price, L.LineTotal,
+                L.VatSum, L.VatPrcnt, L.PriceAfVAT, L.GTotal,
+                L.LineStatus, L.WhsCode, L.TargetType, L.TrgetEntry,
+                ISNULL(I.InvntItem, 'Y') AS InvntItem
+        FROM    {l_table} L
+                LEFT JOIN OITM I ON I.ItemCode = L.ItemCode
+        WHERE   L.DocEntry = ?
+        ORDER BY L.LineNum
         """,
         [doc_entry],
     )
@@ -513,6 +515,8 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
             "LineStatus":      l.LineStatus,
             "LineStatusLabel": LINE_STATUS_MAP.get(l.LineStatus, l.LineStatus or ""),
             "WhsCode":     l.WhsCode,
+            # OITM.InvntItem='N' → servicio/mano de obra: se entrega sin stock.
+            "NonInventory": (l.InvntItem or "Y") != "Y",
             "StockHere":   0.0,   # Se llena después con _enrich_lines_with_stock
             "StockOther":  0.0,   # Se llena después
             "TargetType":  int(l.TargetType) if l.TargetType is not None else None,
