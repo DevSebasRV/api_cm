@@ -882,6 +882,153 @@ def get_service_call(
         return err(500, f"Error interno: {e}")
 
 
+@router.get(
+    "/serviceCalls/{call_id}/prefactura",
+    summary="Datos del ticket de PREFACTURA: entregas de la ODS con U_PREFAC='Si'",
+)
+def get_prefactura(
+    call_id: int,
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Replica los datos del ticket térmico "Ticket_Prefactura" de SAP (Crystal):
+    emisor (OADM), cliente (OCRD), vehículo (OINS/OSCL: placa=internalSN,
+    serie=motor=manufSN — así lo imprime el Crystal), y las ENTREGAS de la ODS
+    marcadas con U_PREFAC='Si' (no canceladas), con sus líneas y totales.
+    Las entregas se resuelven con las mismas ligas veraces del detalle:
+    SCL4 + BaseType=191 + marcador "ODS #<n>" en Comments.
+    """
+    _, database = resolve_db(x_sap_db)
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT customer, custmrName, manufSN, internalSN, insID "
+                "FROM OSCL WHERE callID = ?", [call_id],
+            )
+            ods = cursor.fetchone()
+            if not ods:
+                return err(404, f"La orden de servicio {call_id} no existe.")
+
+            # ── Entregas ligadas a la ODS (SCL4 ∪ BaseType 191 ∪ marcador) ──
+            entries: set = set()
+            cursor.execute(
+                "SELECT DISTINCT DocAbs FROM SCL4 "
+                "WHERE SrcvCallID = ? AND Object = '15' AND DocAbs IS NOT NULL",
+                [call_id],
+            )
+            entries.update(int(r.DocAbs) for r in cursor.fetchall())
+            cursor.execute(
+                "SELECT DISTINCT DocEntry FROM DLN1 WHERE BaseType = 191 AND BaseEntry = ?",
+                [call_id],
+            )
+            entries.update(int(r.DocEntry) for r in cursor.fetchall())
+            marker_re = re.compile(rf"ODS\s*#?\s*{call_id}(?:\D|$)")
+            cursor.execute(
+                "SELECT DocEntry, ISNULL(Comments,'') AS c FROM ODLN WHERE Comments LIKE ?",
+                [f"%ODS #{call_id}%"],
+            )
+            entries.update(int(r.DocEntry) for r in cursor.fetchall() if marker_re.search(r.c))
+
+            entregas, lineas = [], []
+            subtotal = iva = total = 0.0
+            fecha = None
+            placa_udf = ""
+            if entries:
+                marks = ",".join("?" * len(entries))
+                cursor.execute(
+                    f"SELECT DocEntry, DocNum, DocDate, DocTotal, VatSum, "
+                    f"       ISNULL(U_placas,'') AS placas "
+                    f"FROM ODLN WHERE DocEntry IN ({marks}) "
+                    f"  AND ISNULL(U_PREFAC,'-') = 'Si' AND CANCELED = 'N' "
+                    f"ORDER BY DocNum",
+                    list(entries),
+                )
+                heads = cursor.fetchall()
+                for h in heads:
+                    entregas.append(int(h.DocNum))
+                    total += float(h.DocTotal or 0)
+                    iva   += float(h.VatSum or 0)
+                    if h.DocDate and (fecha is None or h.DocDate > fecha):
+                        fecha = h.DocDate
+                    if not placa_udf and (h.placas or "").strip() not in ("", "-"):
+                        placa_udf = h.placas.strip()
+                if heads:
+                    marks2 = ",".join("?" * len(heads))
+                    cursor.execute(
+                        f"SELECT DocEntry, ItemCode, Dscription, Quantity, Price, LineTotal "
+                        f"FROM DLN1 WHERE DocEntry IN ({marks2}) ORDER BY DocEntry, LineNum",
+                        [int(h.DocEntry) for h in heads],
+                    )
+                    for l in cursor.fetchall():
+                        qty   = float(l.Quantity or 0)
+                        price = float(l.Price or 0)
+                        lt    = float(l.LineTotal or 0)
+                        subtotal += lt
+                        lineas.append({
+                            "itemCode": l.ItemCode,
+                            "name":     l.Dscription,
+                            "quantity": qty,
+                            "price":    round(price, 2),
+                            "total":    round(lt, 2),
+                        })
+
+            # ── Cliente y emisor ────────────────────────────────────────────
+            cursor.execute(
+                "SELECT CardName, LicTradNum, Address, Block, City, County, ZipCode "
+                "FROM OCRD WHERE CardCode = ?", [(ods.customer or "").strip()],
+            )
+            c = cursor.fetchone()
+            dir_partes = [p.strip() for p in
+                          [c.Address if c else "", c.Block if c else "",
+                           c.City if c else "", c.County if c else ""] if p and p.strip()]
+            direccion = ",".join(dir_partes)
+            if c and (c.ZipCode or "").strip():
+                direccion = f"{direccion},{c.ZipCode.strip()}" if direccion else c.ZipCode.strip()
+
+            cursor.execute("SELECT CompnyName, CompnyAddr, TaxIdNum FROM OADM")
+            adm = cursor.fetchone()
+            emisor_lineas = [ln.strip() for ln in str(adm.CompnyAddr or "").replace("\r\n", "\r")
+                             .replace("\n", "\r").split("\r") if ln.strip()]
+
+            return {
+                "success": True, "message": None,
+                "data": {
+                    "ods":     call_id,
+                    "fecha":   fecha.date().isoformat() if fecha else None,
+                    "emisor": {
+                        "nombre":    (adm.CompnyName or "").strip(),
+                        "direccion": emisor_lineas,
+                        "rfc":       (adm.TaxIdNum or "").strip(),
+                    },
+                    "cliente": {
+                        "nombre":    (c.CardName if c else ods.custmrName or "").strip(),
+                        "direccion": direccion,
+                        "rfc":       ((c.LicTradNum if c else "") or "").strip(),
+                    },
+                    "vehiculo": {
+                        # Mismo mapeo que el Crystal de SAP: serie y motor = manufSN.
+                        "placa": placa_udf or (ods.internalSN or "").strip(),
+                        "serie": (ods.manufSN or "").strip(),
+                        "motor": (ods.manufSN or "").strip(),
+                    },
+                    "entregas": entregas,
+                    "lineas":   lineas,
+                    "subtotal": round(subtotal, 2),
+                    "iva":      round(iva, 2),
+                    "total":    round(total, 2),
+                },
+            }
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3) GET /equipment/customer/{card_code} — tarjetas de equipo del cliente
 # ─────────────────────────────────────────────────────────────────────────────
