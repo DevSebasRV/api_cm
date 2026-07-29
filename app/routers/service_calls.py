@@ -894,7 +894,8 @@ def get_prefactura(
     Replica los datos del ticket térmico "Ticket_Prefactura" de SAP (Crystal):
     emisor (OADM), cliente (OCRD), vehículo (OINS/OSCL: placa=internalSN,
     serie=motor=manufSN — así lo imprime el Crystal), y las ENTREGAS de la ODS
-    marcadas con U_PREFAC='Si' (no canceladas), con sus líneas y totales.
+    marcadas con U_PREFAC='Si' (no canceladas NI ya facturadas), con sus
+    líneas y totales.
     Las entregas se resuelven con las mismas ligas veraces del detalle:
     SCL4 + BaseType=191 + marcador "ODS #<n>" en Comments.
     """
@@ -937,12 +938,17 @@ def get_prefactura(
             placa_udf = ""
             if entries:
                 marks = ",".join("?" * len(entries))
+                # Se excluyen canceladas y las YA FACTURADAS (alguna línea
+                # copiada a una Factura, TargetType 13): lo facturado ya se
+                # cobró y no debe volver a salir en la prefactura.
                 cursor.execute(
-                    f"SELECT DocEntry, DocNum, DocDate, DocTotal, VatSum, "
-                    f"       ISNULL(U_placas,'') AS placas "
-                    f"FROM ODLN WHERE DocEntry IN ({marks}) "
-                    f"  AND ISNULL(U_PREFAC,'-') = 'Si' AND CANCELED = 'N' "
-                    f"ORDER BY DocNum",
+                    f"SELECT d.DocEntry, d.DocNum, d.DocDate, d.DocTotal, d.VatSum, "
+                    f"       ISNULL(d.U_placas,'') AS placas "
+                    f"FROM ODLN d WHERE d.DocEntry IN ({marks}) "
+                    f"  AND ISNULL(d.U_PREFAC,'-') = 'Si' AND d.CANCELED = 'N' "
+                    f"  AND NOT EXISTS (SELECT 1 FROM DLN1 t "
+                    f"                  WHERE t.DocEntry = d.DocEntry AND t.TargetType = 13) "
+                    f"ORDER BY d.DocNum",
                     list(entries),
                 )
                 heads = cursor.fetchall()
