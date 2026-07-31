@@ -325,6 +325,7 @@ _DETAIL_HEADER = """
             OSCO.Name            AS OrigenName,
             OSCP.Name            AS ProblemName,
             OUSR.U_NAME          AS TecnicoName,
+            LTRIM(RTRIM(ISNULL(EMP.firstName,'') + ' ' + ISNULL(EMP.lastName,''))) AS AsesorName,
             OINS.manufSN         AS EquipManufSN,
             OINS.internalSN      AS EquipInternalSN,
             OINS.U_Ps_Marca      AS EquipMarca,
@@ -339,6 +340,7 @@ _DETAIL_HEADER = """
     LEFT    JOIN OSCO ON OSCO.originID    = OSCL.origin
     LEFT    JOIN OSCP ON OSCP.prblmTypID  = OSCL.problemTyp
     LEFT    JOIN OUSR ON OUSR.USERID      = OSCL.assignee
+    LEFT    JOIN OHEM EMP ON EMP.empID    = OSCL.technician
     LEFT    JOIN OINS ON OINS.insID       = OSCL.insID
     LEFT    JOIN OITM ON OITM.ItemCode    = OSCL.itemCode
     WHERE   OSCL.callID = ?
@@ -384,6 +386,8 @@ def _build_header(r) -> Dict[str, Any]:
         "ProblemType":      r.ProblemName,
         "ContractID":       int(r.contractID) if r.contractID else None,
         "Tecnico":          (r.TecnicoName or "").strip() or None,
+        # Asesor de servicio = OSCL.technician (empleado OHEM), editable como el técnico.
+        "Asesor":           (r.AsesorName or "").strip() or None,
         "CreateDate":       r.createDate.isoformat() if r.createDate else None,
         "CreateTime":       int(r.createTime) if r.createTime is not None else None,
         "CloseDate":        r.closeDate.isoformat() if r.closeDate else None,
@@ -485,6 +489,20 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
     if not h:
         return None
 
+    # Solo ENTREGAS: el UDF U_PREFAC (Sí/-/No) que decide si entra al ticket
+    # de prefactura. El portal lo muestra y lo puede alternar.
+    prefactura = None
+    if obj_type == 15:
+        try:
+            cursor.execute(
+                "SELECT ISNULL(U_PREFAC, '-') AS p FROM ODLN WHERE DocEntry = ?",
+                [doc_entry],
+            )
+            row = cursor.fetchone()
+            prefactura = (row.p or "-").strip() if row else None
+        except pyodbc.Error:
+            prefactura = None
+
     cursor.execute(
         f"""
         SELECT  L.LineNum, L.ItemCode, L.Dscription, L.Quantity, L.Price, L.LineTotal,
@@ -539,6 +557,7 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
         "CardCode":   h.CardCode,
         "CardName":   h.CardName,
         "Comments":   h.Comments,
+        "Prefactura": prefactura,   # solo entregas; None en los demás tipos
         "Lines":      lines,
     }
 
@@ -1250,6 +1269,21 @@ def get_catalogs(
                 except pyodbc.Error:
                     branch_codes = []
 
+            # Posiciones (OHPS) por NOMBRE — el posID cambia entre empresas.
+            # El cliente mantiene en OHEM.position: "Asesor de Servicio" / "Tecnico".
+            asesor_pos: List[int] = []
+            tecnico_pos: List[int] = []
+            try:
+                cursor.execute("SELECT posID, name FROM OHPS")
+                for r in cursor.fetchall():
+                    n = (r.name or "").strip().lower()
+                    if "asesor" in n:
+                        asesor_pos.append(int(r.posID))
+                    elif "tecnic" in n or "técnic" in n:
+                        tecnico_pos.append(int(r.posID))
+            except pyodbc.Error:
+                pass
+
             def _fetch_people(codes: List[int]):
                 """Devuelve (employees, technicians) activos, filtrados por los
                 códigos de sucursal si `codes` no está vacío."""
@@ -1260,58 +1294,78 @@ def get_catalogs(
                 else:
                     where_branch, params = "", []
 
-                # Asesores = todos los empleados activos (de la sucursal si aplica)
-                try:
+                def _emp_query(extra_where: str, extra_params: List[Any]):
                     cursor.execute(
                         "SELECT h.empID, h.firstName, h.lastName "
                         "FROM   OHEM h "
-                        "WHERE  ISNULL(h.Active,'Y')='Y' " + where_branch +
+                        "WHERE  ISNULL(h.Active,'Y')='Y' " + where_branch + extra_where +
                         "ORDER BY h.firstName, h.lastName",
-                        params,
+                        params + extra_params,
                     )
-                except pyodbc.Error:
-                    cursor.execute("SELECT empID, firstName, lastName FROM OHEM ORDER BY firstName, lastName")
-                emps = [
-                    {"id": int(r.empID),
-                     "name": (f"{r.firstName or ''} {r.lastName or ''}").strip() or f"#{r.empID}"}
-                    for r in cursor.fetchall()
-                ]
-
-                # Técnicos: SAP exige que OSCL.technician tenga "rol de técnico".
-                # El set fiable son los empleados ACTIVOS ya usados como técnico.
-                try:
-                    cursor.execute(
-                        "SELECT h.empID, h.firstName, h.lastName "
-                        "FROM   OHEM h "
-                        "WHERE  ISNULL(h.Active,'Y')='Y' " + where_branch +
-                        "  AND  h.empID IN (SELECT DISTINCT technician FROM OSCL WHERE technician IS NOT NULL) "
-                        "ORDER BY h.firstName, h.lastName",
-                        params,
-                    )
-                    techs = [
+                    return [
                         {"id": int(r.empID),
                          "name": (f"{r.firstName or ''} {r.lastName or ''}").strip() or f"#{r.empID}"}
                         for r in cursor.fetchall()
                     ]
+
+                # Empleados (lista completa, legado)
+                try:
+                    emps = _emp_query("", [])
                 except pyodbc.Error:
-                    techs = emps   # fallback: si falla, no bloqueamos
+                    cursor.execute("SELECT empID, firstName, lastName FROM OHEM ORDER BY firstName, lastName")
+                    emps = [
+                        {"id": int(r.empID),
+                         "name": (f"{r.firstName or ''} {r.lastName or ''}").strip() or f"#{r.empID}"}
+                        for r in cursor.fetchall()
+                    ]
+
+                # Asesores: por POSICIÓN "Asesor de Servicio" (OHEM.position).
+                # Respaldo si nadie la tiene: empleados ya usados como technician
+                # (el criterio anterior), para no bloquear el alta.
+                techs: List[Dict[str, Any]] = []
+                if asesor_pos:
+                    try:
+                        ph_pos = ",".join("?" * len(asesor_pos))
+                        techs = _emp_query(f" AND h.position IN ({ph_pos}) ", list(asesor_pos))
+                    except pyodbc.Error:
+                        techs = []
+                if not techs:
+                    try:
+                        techs = _emp_query(
+                            " AND h.empID IN (SELECT DISTINCT technician FROM OSCL WHERE technician IS NOT NULL) ",
+                            [],
+                        )
+                    except pyodbc.Error:
+                        techs = emps   # último recurso: no bloqueamos
 
                 # Mecánicos = USUARIOS (OUSR) con empleado activo — es lo que
-                # SAP guarda en OSCL.assignee (campo "Mecánico" del formulario).
-                try:
+                # SAP guarda en OSCL.assignee. Por POSICIÓN "Tecnico"; respaldo
+                # sin filtro de posición si nadie la tiene.
+                def _mec_query(extra_where: str, extra_params: List[Any]):
                     cursor.execute(
                         "SELECT DISTINCT u.USERID, u.U_NAME "
                         "FROM   OUSR u JOIN OHEM h ON h.userId = u.USERID "
-                        "WHERE  ISNULL(h.Active,'Y')='Y' " + where_branch.replace("h.branch", "h.branch") +
+                        "WHERE  ISNULL(h.Active,'Y')='Y' " + where_branch + extra_where +
                         "ORDER BY u.U_NAME",
-                        params,
+                        params + extra_params,
                     )
-                    mecs = [
+                    return [
                         {"id": int(r.USERID), "name": (r.U_NAME or f"#{r.USERID}").strip()}
                         for r in cursor.fetchall()
                     ]
-                except pyodbc.Error:
-                    mecs = []
+
+                mecs: List[Dict[str, Any]] = []
+                if tecnico_pos:
+                    try:
+                        ph_pos = ",".join("?" * len(tecnico_pos))
+                        mecs = _mec_query(f" AND h.position IN ({ph_pos}) ", list(tecnico_pos))
+                    except pyodbc.Error:
+                        mecs = []
+                if not mecs:
+                    try:
+                        mecs = _mec_query("", [])
+                    except pyodbc.Error:
+                        mecs = []
                 return emps, techs, mecs
 
             employees, technicians, mecanicos = _fetch_people(branch_codes)
