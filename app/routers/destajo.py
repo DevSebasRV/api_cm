@@ -15,6 +15,7 @@ from fastapi import APIRouter, Header, Body
 from typing import Optional, Any, Dict, List
 from decimal import Decimal
 import datetime
+import unicodedata
 import pyodbc
 
 from app.database import get_connection
@@ -31,15 +32,35 @@ def _val(v: Any) -> Any:
     return v
 
 
-# Mismo filtro que la app de Retool (Q_Tecnico): usuarios SAP que son técnicos
-# (excluye departamentos administrativos y al usuario 'AV').
-_TECNICOS_SQL = """
-    SELECT  T0.USERID, T0.USER_CODE, T0.U_NAME
-    FROM    OUSR T0
-    WHERE   T0.U_NAME NOT IN ('AV')
-      AND   T0.DEPARTMENT NOT IN (-2,9,1,3,10,20,4,6,8,1,2,11)
-    ORDER BY T0.U_NAME
-"""
+# Filtro de técnicos (heredado de la app de Retool "Q_Tecnico"): excluir
+# administración y ventas. La lista original era por CÓDIGO de departamento,
+# pero los códigos significan cosas DISTINTAS en cada empresa (en PROSHOP el
+# código 1 es el taller "Serv Pat Suzuki" y bloqueaba a sus técnicos). Ahora
+# se excluye por NOMBRE (normalizado sin acentos), correcto en ambas bases.
+_DEPARTAMENTOS_EXCLUIDOS = {
+    "general", "gerencia de ventas", "venta motos", "venta ref. y acc.",
+    "gerente tienda", "caja", "contabilidad", "sistemas", "direccion",
+    "compras", "boutique", "refacciones", "motos", "cuentas por cobrar",
+    "almacen", "venta de moto suzuki",
+}
+
+
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFD", (s or "").strip().lower())
+    return "".join(c for c in s if unicodedata.category(c) != "Mn")
+
+
+def _codigos_dep_excluidos(cursor) -> List[int]:
+    """-2 (sin departamento) + los departamentos administrativos POR NOMBRE."""
+    codes = [-2]
+    try:
+        cursor.execute("SELECT Code, Name FROM OUDP")
+        for r in cursor.fetchall():
+            if _norm(r.Name) in _DEPARTAMENTOS_EXCLUIDOS:
+                codes.append(int(r.Code))
+    except pyodbc.Error:
+        pass
+    return codes
 
 
 @router.get(
@@ -54,7 +75,16 @@ def list_destajo_tecnicos(
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
-            cursor.execute(_TECNICOS_SQL)
+            excl = _codigos_dep_excluidos(cursor)
+            marks = ",".join("?" * len(excl))
+            cursor.execute(
+                f"SELECT T0.USERID, T0.USER_CODE, T0.U_NAME "
+                f"FROM OUSR T0 "
+                f"WHERE T0.U_NAME NOT IN ('AV') "
+                f"  AND T0.DEPARTMENT NOT IN ({marks}) "
+                f"ORDER BY T0.U_NAME",
+                excl,
+            )
             tecnicos = [
                 {"userId": int(r.USERID), "userCode": r.USER_CODE, "name": (r.U_NAME or "").strip()}
                 for r in cursor.fetchall() if (r.U_NAME or "").strip()
