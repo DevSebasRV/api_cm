@@ -16,7 +16,7 @@ capturarse en SAP con fecha de julio) y las facturas SAP del rango (para los
 reportes de "sin UUID" y "en SAP pero no en la descarga").
 """
 
-from fastapi import APIRouter, Header, Body
+from fastapi import APIRouter, Header, Body, Query
 from typing import Optional, List, Dict, Any
 import re
 import pyodbc
@@ -128,6 +128,94 @@ def cfdi_reconcile(
                 "matches":  matches,          # {uuid: factura SAP}
                 "inRange":  in_range,         # facturas SAP del rango (con o sin uuid)
             }
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
+@router.get(
+    "/cfdiMatchCandidates",
+    summary="Facturas de proveedor (OPCH) candidatas para un CFDI sin capturar",
+)
+def cfdi_match_candidates(
+    rfc:      str            = Query(..., description="RFC del proveedor emisor del CFDI"),
+    total:    float          = Query(..., description="Total del CFDI"),
+    tol:      float          = Query(default=1.0, description="Tolerancia de importe (pesos)"),
+    limit:    int            = Query(default=15, ge=1, le=50),
+    x_sap_db: Optional[str]  = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Para la pestaña "Faltan por capturar": dado el RFC del proveedor y el total
+    del CFDI, busca facturas de proveedor en SAP (OPCH) SIN UUID que puedan ser
+    ese comprobante, para que el usuario elija una y se le grabe el UUID.
+
+    Prioridad:
+      1. Mismo RFC (OCRD.LicTradNum) — todas las del proveedor sin capturar,
+         ordenadas por cercanía del total; `exact` = dentro de la tolerancia.
+      2. Si el RFC no existe como proveedor en SAP → respaldo por SOLO total
+         (cualquier proveedor, dentro de la tolerancia).
+    """
+    _, database = resolve_db(x_sap_db)
+    rfc = (rfc or "").strip().upper()
+
+    def _view(r) -> Dict[str, Any]:
+        return {
+            "docEntry": int(r.DocEntry),
+            "docNum":   int(r.DocNum),
+            "cardCode": r.CardCode,
+            "cardName": r.CardName,
+            "docDate":  r.DocDate.date().isoformat() if r.DocDate else None,
+            "docTotal": float(r.DocTotal) if r.DocTotal is not None else 0.0,
+            "docCur":   (r.DocCur or "").strip() or None,
+            "diff":     round(float(r.Dif), 2),
+            "exact":    float(r.Dif) <= tol,
+        }
+
+    _NO_UUID = ("LTRIM(RTRIM(ISNULL(p.U_CVM_BFOLIOUUID,''))) = '' "
+                "AND LTRIM(RTRIM(ISNULL(p.U_UUID,''))) = ''")
+
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            # 1) Por RFC del proveedor
+            cursor.execute(
+                f"""
+                SELECT TOP {int(limit)}
+                       p.DocEntry, p.DocNum, p.CardCode, p.CardName, p.DocDate,
+                       p.DocTotal, p.DocCur, ABS(p.DocTotal - ?) AS Dif
+                FROM   OPCH p JOIN OCRD c ON c.CardCode = p.CardCode
+                WHERE  c.LicTradNum = ? AND p.CANCELED = 'N' AND {_NO_UUID}
+                ORDER BY Dif, p.DocEntry DESC
+                """,
+                [float(total), rfc],
+            )
+            rows = [_view(r) for r in cursor.fetchall()]
+            mode = "rfc" if rows else None
+
+            # 2) Respaldo por solo total (si el RFC no existe como proveedor)
+            if not rows:
+                cursor.execute(
+                    f"""
+                    SELECT TOP {int(limit)}
+                           p.DocEntry, p.DocNum, p.CardCode, p.CardName, p.DocDate,
+                           p.DocTotal, p.DocCur, ABS(p.DocTotal - ?) AS Dif
+                    FROM   OPCH p
+                    WHERE  p.CANCELED = 'N' AND {_NO_UUID}
+                      AND  ABS(p.DocTotal - ?) <= ?
+                    ORDER BY Dif, p.DocEntry DESC
+                    """,
+                    [float(total), float(total), tol],
+                )
+                rows = [_view(r) for r in cursor.fetchall()]
+                mode = "total" if rows else "none"
+
+            return {"success": True, "message": None,
+                    "data": {"candidates": rows, "mode": mode}}
         finally:
             cursor.close()
             conn.close()
