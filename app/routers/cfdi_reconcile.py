@@ -150,14 +150,13 @@ def cfdi_match_candidates(
 ):
     """
     Para la pestaña "Faltan por capturar": dado el RFC del proveedor y el total
-    del CFDI, busca facturas de proveedor en SAP (OPCH) SIN UUID que puedan ser
-    ese comprobante, para que el usuario elija una y se le grabe el UUID.
+    del CFDI, busca facturas de proveedor en SAP (OPCH) SIN UUID que coincidan
+    en AMBOS — mismo RFC (OCRD.LicTradNum) Y el total dentro de la tolerancia —
+    para que el usuario elija una y se le grabe el UUID.
 
-    Prioridad:
-      1. Mismo RFC (OCRD.LicTradNum) — todas las del proveedor sin capturar,
-         ordenadas por cercanía del total; `exact` = dentro de la tolerancia.
-      2. Si el RFC no existe como proveedor en SAP → respaldo por SOLO total
-         (cualquier proveedor, dentro de la tolerancia).
+    Se exige RFC Y total a propósito: solo por importe habría demasiadas
+    coincidencias de otros proveedores, y un RFC que no exista como socio en SAP
+    no puede tener factura (no hay match real).
     """
     _, database = resolve_db(x_sap_db)
     rfc = (rfc or "").strip().upper()
@@ -182,7 +181,7 @@ def cfdi_match_candidates(
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
-            # 1) Por RFC del proveedor
+            # Coincidencia por RFC del proveedor Y total (dentro de la tolerancia).
             cursor.execute(
                 f"""
                 SELECT TOP {int(limit)}
@@ -190,32 +189,15 @@ def cfdi_match_candidates(
                        p.DocTotal, p.DocCur, ABS(p.DocTotal - ?) AS Dif
                 FROM   OPCH p JOIN OCRD c ON c.CardCode = p.CardCode
                 WHERE  c.LicTradNum = ? AND p.CANCELED = 'N' AND {_NO_UUID}
+                  AND  ABS(p.DocTotal - ?) <= ?
                 ORDER BY Dif, p.DocEntry DESC
                 """,
-                [float(total), rfc],
+                [float(total), rfc, float(total), tol],
             )
             rows = [_view(r) for r in cursor.fetchall()]
-            mode = "rfc" if rows else None
-
-            # 2) Respaldo por solo total (si el RFC no existe como proveedor)
-            if not rows:
-                cursor.execute(
-                    f"""
-                    SELECT TOP {int(limit)}
-                           p.DocEntry, p.DocNum, p.CardCode, p.CardName, p.DocDate,
-                           p.DocTotal, p.DocCur, ABS(p.DocTotal - ?) AS Dif
-                    FROM   OPCH p
-                    WHERE  p.CANCELED = 'N' AND {_NO_UUID}
-                      AND  ABS(p.DocTotal - ?) <= ?
-                    ORDER BY Dif, p.DocEntry DESC
-                    """,
-                    [float(total), float(total), tol],
-                )
-                rows = [_view(r) for r in cursor.fetchall()]
-                mode = "total" if rows else "none"
 
             return {"success": True, "message": None,
-                    "data": {"candidates": rows, "mode": mode}}
+                    "data": {"candidates": rows, "mode": "rfc" if rows else "none"}}
         finally:
             cursor.close()
             conn.close()
