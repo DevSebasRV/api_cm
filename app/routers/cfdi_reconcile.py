@@ -205,3 +205,49 @@ def cfdi_match_candidates(
         return err(500, f"Error de SAP B1: {db_err}")
     except Exception as e:
         return err(500, f"Error interno: {e}")
+
+
+@router.get(
+    "/cfdiUncapturedInvoices",
+    summary="Facturas de proveedor (OPCH) SIN UUID: RFC + total (para marcar filas)",
+)
+def cfdi_uncaptured_invoices(
+    months:   int            = Query(default=18, ge=1, le=60),
+    x_sap_db: Optional[str]  = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Lista compacta {rfc, total} de facturas de proveedor sin UUID de los últimos
+    N meses. El portal la usa para saber, por adelantado, qué CFDIs de "Faltan
+    por capturar" tienen candidata (colorear el botón y ordenar), sin una
+    consulta por fila.
+    """
+    _, database = resolve_db(x_sap_db)
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                SELECT o.LicTradNum AS rfc, p.DocTotal
+                FROM   OPCH p JOIN OCRD o ON o.CardCode = p.CardCode
+                WHERE  p.CANCELED = 'N'
+                  AND  LTRIM(RTRIM(ISNULL(p.U_CVM_BFOLIOUUID,''))) = ''
+                  AND  LTRIM(RTRIM(ISNULL(p.U_UUID,''))) = ''
+                  AND  o.LicTradNum IS NOT NULL AND LTRIM(RTRIM(o.LicTradNum)) <> ''
+                  AND  p.DocDate >= DATEADD(month, -{int(months)}, GETDATE())
+                """,
+            )
+            invoices = [
+                {"rfc": (r.rfc or "").strip().upper(),
+                 "total": float(r.DocTotal) if r.DocTotal is not None else 0.0}
+                for r in cursor.fetchall()
+            ]
+            return {"success": True, "message": None,
+                    "data": {"invoices": invoices}}
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
