@@ -23,8 +23,13 @@ PRICE_LIST_CODE = 1
 # ─────────────────────────────────────────────────────────────────────────────
 # Lista de precios que se mapea al campo Compare At Price de Shopify.
 # Puede sobrescribirse vía .env si el código cambia por base.
-# (El Variant Price se responde fijo en 0.0 — ver routers/shopify.py.)
 SHOPIFY_COMPARE_AT_PRICE_LIST = int(os.getenv("SHOPIFY_COMPARE_AT_PRICE_LIST", "1"))  # "LISTA DE PRECIOS 01"
+
+# Lista de precios (por NOMBRE) de la que sale el "Variant Price" de Shopify.
+# Se resuelve por nombre porque el número difiere entre bases y puede no existir
+# en alguna: "Descuentos Boutique" solo está en Promo/cp (= lista 3); en
+# Ferbel/fn no existe → el Variant Price sale en 0.
+SHOPIFY_VARIANT_PRICE_LIST_NAME = os.getenv("SHOPIFY_VARIANT_PRICE_LIST_NAME", "Descuentos Boutique")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ClearMechanic integration

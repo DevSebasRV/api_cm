@@ -10,8 +10,11 @@ from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any, List
 import pyodbc
 
-# Variant Price se responde fijo en 0.0 (no hay lista de precios para él).
-from app.config import EMPRESAS, SHOPIFY_COMPARE_AT_PRICE_LIST
+from app.config import (
+    EMPRESAS,
+    SHOPIFY_COMPARE_AT_PRICE_LIST,
+    SHOPIFY_VARIANT_PRICE_LIST_NAME,
+)
 from app.database import get_connection
 from app.security import require_api_key
 
@@ -34,7 +37,7 @@ from app.routers.common import DEFAULT_DB_KEY, resolve_db, err, _pagination  # n
 # ─────────────────────────────────────────────────────────────────────────────
 # Mapeo SAP OLCT.Location → nombre Shopify
 # ─────────────────────────────────────────────────────────────────────────────
-# Shopify exige nombres exactos: Coapa, Patriotismo, Roma, Satélite.
+# Shopify exige nombres exactos: Coapa, Patriotismo, Roma, Satelite.
 # Como las sucursales en SAP difieren entre bases (FERBEL guarda "Satélite"
 # con acento, PROSHOP "Satelite" sin acento, etc.), el mapeo es por base.
 #
@@ -43,21 +46,21 @@ from app.routers.common import DEFAULT_DB_KEY, resolve_db, err, _pagination  # n
 SHOPIFY_LOCATION_MAP: Dict[str, Dict[str, str]] = {
     "cp": {  # PROSHOP-2023
         "Patriotismo":      "Patriotismo",
-        "Satelite":         "Satélite",
+        "Satelite":         "Satelite",
         "Sur (Miramontes)": "Coapa",
         # ⚠️ PROSHOP no tiene sucursal "Tonala" — Roma siempre devuelve 0.
         # El almacén TONBOUT está mal asignado a Satelite en SAP — reportar.
     },
     "fn": {  # FERBEL-2023
         "Patriotismo":      "Patriotismo",
-        "Satélite":         "Satélite",
+        "Satélite":         "Satelite",
         "Sur (Miramontes)": "Coapa",
         "Tonala":           "Roma",
         "Zona Esmeralda":   "ZonaEsmeralda",
     },
     "test": {  # PROSHOP-TEST
         "Patriotismo":      "Patriotismo",
-        "Satelite":         "Satélite",
+        "Satelite":         "Satelite",
         "Sur (Miramontes)": "Coapa",
     },
 }
@@ -65,9 +68,9 @@ SHOPIFY_LOCATION_MAP: Dict[str, Dict[str, str]] = {
 # Llaves que SIEMPRE deben aparecer en el JSON (aunque tengan 0 en stock).
 # Shopify espera estos 4 nombres fijos; FERBEL agrega ZonaEsmeralda como 5ª.
 SHOPIFY_REQUIRED_LOCATIONS: Dict[str, list] = {
-    "cp":   ["Coapa", "Patriotismo", "Roma", "Satélite"],
-    "fn":   ["Coapa", "Patriotismo", "Roma", "Satélite", "ZonaEsmeralda"],
-    "test": ["Coapa", "Patriotismo", "Roma", "Satélite"],
+    "cp":   ["Coapa", "Patriotismo", "Roma", "Satelite"],
+    "fn":   ["Coapa", "Patriotismo", "Roma", "Satelite", "ZonaEsmeralda"],
+    "test": ["Coapa", "Patriotismo", "Roma", "Satelite"],
 }
 
 
@@ -672,14 +675,40 @@ def get_stock(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3) GET /shopify/prices
-#    Variant Price (precio descuento) + Variant Compare At Price (lista 01)
+#    Variant Price (lista "Descuentos Boutique") + Compare At Price (lista 01)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Cache del ListNum de una lista de precios por (base, nombre): el número difiere
+# entre bases y puede no existir en alguna.
+_PRICE_LIST_NUM_CACHE: Dict[str, Optional[int]] = {}
+
+
+def _price_list_num(cursor, database: str, name: str) -> Optional[int]:
+    """ListNum de OPLN buscado por NOMBRE (None si esa base no tiene esa lista)."""
+    ck = f"{database}:{name}"
+    if ck in _PRICE_LIST_NUM_CACHE:
+        return _PRICE_LIST_NUM_CACHE[ck]
+    num: Optional[int] = None
+    try:
+        cursor.execute("SELECT ListNum FROM OPLN WHERE LTRIM(RTRIM(ListName)) = ?", [name.strip()])
+        r = cursor.fetchone()
+        if r:
+            num = int(r.ListNum)
+    except pyodbc.Error:
+        num = None
+    _PRICE_LIST_NUM_CACHE[ck] = num
+    return num
+
 
 _PRICES_SELECT = f"""
     SELECT
         SA.Code  AS ItemCode,
+        P1.Price AS VariantPrice,
         P2.Price AS CompareAtPrice
     FROM   [@SHOPIFY_ARTICLE] SA
+    LEFT   JOIN ITM1 P1
+        ON  P1.ItemCode  = SA.Code
+        AND P1.PriceList = ?
     LEFT   JOIN ITM1 P2
         ON  P2.ItemCode  = SA.Code
         AND P2.PriceList = ?
@@ -701,13 +730,15 @@ def _with_iva(price) -> Optional[float]:
 
 def _build_prices(row) -> Dict[str, Any]:
     """
-    - VariantPrice: queda en 0.0 hasta que definan la fuente real.
-    - VariantCompareAtPrice: lista configurada en SHOPIFY_COMPARE_AT_PRICE_LIST
-      multiplicada por 1.16 (IVA 16%).
+    - VariantPrice: lista "Descuentos Boutique" (SHOPIFY_VARIANT_PRICE_LIST_NAME)
+      + 16% IVA. Si la base no tiene esa lista o el artículo no tiene precio ahí,
+      queda en 0.0.
+    - VariantCompareAtPrice: lista SHOPIFY_COMPARE_AT_PRICE_LIST + 16% IVA.
+    SAP guarda los precios SIN IVA; Shopify los muestra CON IVA.
     Las llaves van sin espacios (PascalCase) para facilitar el consumo.
     """
     return {
-        "VariantPrice":            0.0,
+        "VariantPrice":            _with_iva(row.VariantPrice) or 0.0,
         "VariantCompareAtPrice":   _with_iva(row.CompareAtPrice),
     }
 
@@ -724,12 +755,16 @@ def get_prices(
 ):
     _, database = resolve_db(x_sap_db)
 
-    base_params = [SHOPIFY_COMPARE_AT_PRICE_LIST]
-
     try:
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
+            # Variant Price sale de "Descuentos Boutique" (resuelta por nombre;
+            # -1 = no existe en esta base → el JOIN da NULL → 0.0).
+            variant_list = _price_list_num(cursor, database, SHOPIFY_VARIANT_PRICE_LIST_NAME)
+            base_params  = [variant_list if variant_list is not None else -1,
+                            SHOPIFY_COMPARE_AT_PRICE_LIST]
+
             # ── Caso 1: un solo ItemCode ─────────────────────────────────────
             if itemCode:
                 cursor.execute(
