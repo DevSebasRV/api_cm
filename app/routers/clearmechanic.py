@@ -1335,14 +1335,18 @@ def inspection_alerts(
                 params.append(sucursal)
 
             cursor.execute(
-                f"SELECT TOP {limit} callID, customer, custmrName "
-                f"FROM OSCL {where} ORDER BY callID DESC",
+                f"SELECT TOP {limit} OSCL.callID, OSCL.customer, OSCL.custmrName, OSCL.createDate, "
+                f"       LTRIM(RTRIM(ISNULL(EMP.firstName,'') + ' ' + ISNULL(EMP.lastName,''))) AS AsesorName "
+                f"FROM OSCL LEFT JOIN OHEM EMP ON EMP.empID = OSCL.technician "
+                f"{where} ORDER BY OSCL.callID DESC",
                 params,
             )
             ods = [
                 {"callId": int(r.callID),
                  "customer": (r.customer or "").strip(),
-                 "customerName": (r.custmrName or "").strip()}
+                 "customerName": (r.custmrName or "").strip(),
+                 "fecha": r.createDate.isoformat()[:10] if r.createDate else None,
+                 "asesor": (r.AsesorName or "").strip() or None}
                 for r in cursor.fetchall()
             ]
         finally:
