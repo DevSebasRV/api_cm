@@ -479,7 +479,8 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
     cursor.execute(
         f"""
         SELECT  DocEntry, DocNum, DocDate, DocStatus,
-                DocTotal, DocCur, Comments, CardCode, CardName, SlpCode
+                DocTotal, DocCur, Comments, CardCode, CardName, SlpCode,
+                (SELECT SlpName FROM OSLP WHERE OSLP.SlpCode = {o_table}.SlpCode) AS SlpName
         FROM    {o_table}
         WHERE   DocEntry = ?
         """,
@@ -558,6 +559,7 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
         "CardName":   h.CardName,
         "Comments":   h.Comments,
         "SalesPersonCode": int(h.SlpCode) if h.SlpCode is not None and int(h.SlpCode) > 0 else None,
+        "SalesPersonName": ((h.SlpName or "").strip() or None) if (h.SlpCode is not None and int(h.SlpCode) > 0) else None,
         "Prefactura": prefactura,   # solo entregas; None en los demás tipos
         "Lines":      lines,
     }
