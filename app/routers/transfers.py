@@ -83,6 +83,66 @@ def list_transfer_requests(
 
 
 @router.get(
+    "/salespersonWarehouses",
+    summary="Almacenes de la sucursal del vendedor (destino permitido de un traslado)",
+)
+def salesperson_warehouses(
+    slpCode: int,
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """Almacenes que comparten localidad (OLCT) con el almacén del vendedor
+    (OSLP.Telephone, la regla CVMSales). Se usan como DESTINO del traslado.
+
+    Si el vendedor no tiene almacén válido (los exentos traen '.'), se devuelven
+    TODOS los almacenes: es preferible no filtrar a dejar la lista vacía y
+    bloquear el traslado."""
+    _, database = resolve_db(x_sap_db)
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT  w.WhsCode, w.WhsName, ISNULL(l.Location, '') AS Location
+                FROM    OWHS w
+                LEFT    JOIN OLCT l ON l.Code = w.Location
+                WHERE   w.Location = (
+                            SELECT TOP 1 w2.Location FROM OWHS w2
+                            WHERE  w2.WhsCode = (SELECT TOP 1 LTRIM(RTRIM(Telephone))
+                                                 FROM OSLP WHERE SlpCode = ?)
+                        )
+                ORDER BY w.WhsName
+                """,
+                [slpCode],
+            )
+            rows = cursor.fetchall()
+            filtrado = True
+            if not rows:                      # vendedor exento / sin almacén
+                filtrado = False
+                cursor.execute(
+                    "SELECT w.WhsCode, w.WhsName, ISNULL(l.Location,'') AS Location "
+                    "FROM OWHS w LEFT JOIN OLCT l ON l.Code = w.Location ORDER BY w.WhsName"
+                )
+                rows = cursor.fetchall()
+
+            almacenes = [
+                {"code": (r.WhsCode or "").strip(),
+                 "name": (r.WhsName or "").strip(),
+                 "location": (r.Location or "").strip() or None}
+                for r in rows
+            ]
+            return {"success": True, "message": None,
+                    "data": {"warehouses": almacenes, "filtered": filtrado}}
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
+@router.get(
     "/transferRequestsOpen",
     summary="Solicitudes de traslado ABIERTAS ligadas a una ODS, agrupadas por ODS",
 )
