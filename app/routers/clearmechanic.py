@@ -1389,11 +1389,17 @@ def inspection_alerts(
             data = json.loads(body).get("data", {}) or {}
         except Exception:
             return None
-        yellow = int(data.get("yellowItemsCount") or 0)
-        red    = int(data.get("redItemsCount") or 0)
-        if yellow + red == 0:
+        # Salida rápida: la orden no tiene ningún punto rojo/amarillo.
+        if int(data.get("yellowItemsCount") or 0) + int(data.get("redItemsCount") or 0) == 0:
             _INSP_ALERT_CACHE[key] = (now, None)
             return None
+
+        # Solo alertan los puntos rojos/amarillos que FALTA COTIZAR: en CM un
+        # punto cotizado es el que ya tiene estimates (parts o labors), que es
+        # justo lo que escribe el portal al cotizarlo. Los contadores se
+        # recalculan con los pendientes (los de CM incluyen los ya cotizados).
+        yellow = 0
+        red    = 0
         points = []
         for it in (data.get("inspectionItems") or []):
             if not isinstance(it, dict):
@@ -1405,8 +1411,19 @@ def inspection_alerts(
                 color = "amarillo"
             else:
                 continue
+            if (it.get("parts") or []) or (it.get("labors") or []):
+                continue                      # ya cotizado → no alerta
+            if color == "rojo":
+                red += 1
+            else:
+                yellow += 1
             points.append({"name": (it.get("inspectionItemName") or "").strip(),
                            "color": color})
+
+        if yellow + red == 0:                 # todos los puntos ya están cotizados
+            _INSP_ALERT_CACHE[key] = (now, None)
+            return None
+
         base = {"yellow": yellow, "red": red, "points": points,
                 "lastUpdatedTime": data.get("lastUpdatedTime")}
         _INSP_ALERT_CACHE[key] = (now, base)
