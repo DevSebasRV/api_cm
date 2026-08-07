@@ -87,18 +87,29 @@ def list_transfer_requests(
     summary="Solicitudes de traslado ABIERTAS ligadas a una ODS, agrupadas por ODS",
 )
 def list_open_transfer_requests(
+    sucursal: Optional[str] = None,
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
 ):
     """Abiertas (DocStatus='O', no canceladas) que traen U_ODS. Solo las creadas
     desde el portal llevan esa liga; las capturadas directo en SAP no aparecen.
-    Se devuelven agrupadas por ODS, con el cliente de la orden (OSCL)."""
+    Se devuelven agrupadas por ODS, con el cliente de la orden (OSCL).
+
+    `sucursal` (OUBR.Name) limita a las órdenes cuyo ASESOR pertenece a esa
+    sucursal — mismo criterio que el resto del portal (OSCL.technician → OHEM →
+    OUBR). Sin sucursal se devuelven todas."""
     _, database = resolve_db(x_sap_db)
+    filtro_suc = ""
+    params: List[Any] = []
+    if sucursal and sucursal.strip():
+        filtro_suc = (" AND c.technician IN (SELECT h.empID FROM OHEM h "
+                      "JOIN OUBR b ON b.Code = h.branch WHERE b.Name = ?)")
+        params.append(sucursal.strip())
     try:
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
             cursor.execute(
-                """
+                f"""
                 SELECT  q.DocEntry, q.DocNum, q.DocDate, q.U_ODS,
                         s.SlpName,
                         q.Filler    AS FromWhs,
@@ -116,8 +127,10 @@ def list_open_transfer_requests(
                 WHERE   q.DocStatus = 'O'
                   AND   ISNULL(q.CANCELED, 'N') <> 'Y'
                   AND   q.U_ODS IS NOT NULL AND q.U_ODS <> ''
+                  {filtro_suc}
                 ORDER BY q.DocEntry DESC
-                """
+                """,
+                params,
             )
             por_ods: Dict[str, Dict[str, Any]] = {}
             total = 0
