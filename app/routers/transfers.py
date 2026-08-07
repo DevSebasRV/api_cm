@@ -83,6 +83,76 @@ def list_transfer_requests(
 
 
 @router.get(
+    "/transferRequestsOpen",
+    summary="Solicitudes de traslado ABIERTAS ligadas a una ODS, agrupadas por ODS",
+)
+def list_open_transfer_requests(
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """Abiertas (DocStatus='O', no canceladas) que traen U_ODS. Solo las creadas
+    desde el portal llevan esa liga; las capturadas directo en SAP no aparecen.
+    Se devuelven agrupadas por ODS, con el cliente de la orden (OSCL)."""
+    _, database = resolve_db(x_sap_db)
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT  q.DocEntry, q.DocNum, q.DocDate, q.U_ODS,
+                        s.SlpName,
+                        q.Filler    AS FromWhs,
+                        wf.WhsName  AS FromWhsName,
+                        q.ToWhsCode AS ToWhs,
+                        wt.WhsName  AS ToWhsName,
+                        (SELECT COUNT(*) FROM WTQ1 l WHERE l.DocEntry = q.DocEntry) AS Lineas,
+                        c.custmrName AS OdsCliente,
+                        c.createDate AS OdsFecha
+                FROM    OWTQ q
+                LEFT    JOIN OSLP s  ON s.SlpCode  = q.SlpCode
+                LEFT    JOIN OWHS wf ON wf.WhsCode = q.Filler
+                LEFT    JOIN OWHS wt ON wt.WhsCode = q.ToWhsCode
+                LEFT    JOIN OSCL c  ON CAST(c.callID AS NVARCHAR(20)) = q.U_ODS
+                WHERE   q.DocStatus = 'O'
+                  AND   ISNULL(q.CANCELED, 'N') <> 'Y'
+                  AND   q.U_ODS IS NOT NULL AND q.U_ODS <> ''
+                ORDER BY q.DocEntry DESC
+                """
+            )
+            por_ods: Dict[str, Dict[str, Any]] = {}
+            total = 0
+            for r in cursor.fetchall():
+                ods = (r.U_ODS or "").strip()
+                grupo = por_ods.setdefault(ods, {
+                    "ods":       int(ods) if ods.isdigit() else None,
+                    "cliente":   (r.OdsCliente or "").strip() or None,
+                    "odsFecha":  r.OdsFecha.date().isoformat() if r.OdsFecha else None,
+                    "solicitudes": [],
+                })
+                grupo["solicitudes"].append({
+                    "docEntry": int(r.DocEntry),
+                    "docNum":   int(r.DocNum),
+                    "fecha":    r.DocDate.date().isoformat() if r.DocDate else None,
+                    "fromWhs":  {"code": (r.FromWhs or "").strip(), "name": (r.FromWhsName or "").strip() or None},
+                    "toWhs":    {"code": (r.ToWhs or "").strip(),   "name": (r.ToWhsName or "").strip() or None},
+                    "vendedor": (r.SlpName or "").strip() or None,
+                    "lineas":   int(r.Lineas or 0),
+                })
+                total += 1
+
+            grupos = sorted(por_ods.values(), key=lambda g: (g["ods"] or 0), reverse=True)
+            return {"success": True, "message": None,
+                    "data": {"grupos": grupos, "total": total, "ods": len(grupos)}}
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
+@router.get(
     "/transferRequests/{doc_entry}/ticket",
     summary="Datos del ticket térmico de una solicitud de traslado",
 )
