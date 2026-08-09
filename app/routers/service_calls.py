@@ -1057,6 +1057,85 @@ def get_prefactura(
         return err(500, f"Error interno: {e}")
 
 
+@router.get(
+    "/surtidoPendiente",
+    summary="ODS abiertas con ofertas abiertas pendientes de surtir (módulo de Refacciones)",
+)
+def surtido_pendiente(
+    sucursal: Optional[str] = Query(default=None,
+        description="Limita a órdenes cuyo asesor pertenece a esa sucursal (OUBR.Name)"),
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """Cola de trabajo de Refacciones: ODS ABIERTAS (closeDate IS NULL) que
+    tienen ofertas ABIERTAS con líneas por surtir (QUT1.LineStatus='O'),
+    agrupadas por orden. La liga oferta↔ODS es la grilla SCL4 (Object='23'),
+    la misma fuente veraz que usa el detalle de la orden — ofertas cuya liga
+    falló (raro; quedan solo con el marcador en Comments) no aparecen."""
+    _, database = resolve_db(x_sap_db)
+    filtro_suc = ""
+    params: List[Any] = []
+    if sucursal and sucursal.strip():
+        filtro_suc = (" AND s.technician IN (SELECT h.empID FROM OHEM h "
+                      "JOIN OUBR b ON b.Code = h.branch WHERE b.Name = ?)")
+        params.append(sucursal.strip())
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                SELECT  s.callID, s.custmrName, s.createDate,
+                        LTRIM(RTRIM(ISNULL(h.firstName,'') + ' ' + ISNULL(h.lastName,''))) AS AsesorName,
+                        q.DocEntry, q.DocNum, q.DocDate, q.DocTotal, q.Comments,
+                        (SELECT COUNT(*) FROM QUT1 l
+                         WHERE l.DocEntry = q.DocEntry AND l.LineStatus = 'O') AS LineasAbiertas
+                FROM    OQUT q
+                JOIN    SCL4 x ON x.[Object] = '23' AND x.DocAbs = q.DocEntry
+                JOIN    OSCL s ON s.callID = x.SrcvCallID
+                LEFT    JOIN OHEM h ON h.empID = s.technician
+                WHERE   q.DocStatus = 'O'
+                  AND   ISNULL(q.CANCELED, 'N') <> 'Y'
+                  AND   s.closeDate IS NULL
+                  AND   EXISTS (SELECT 1 FROM QUT1 l
+                                WHERE l.DocEntry = q.DocEntry AND l.LineStatus = 'O')
+                  {filtro_suc}
+                ORDER BY s.callID DESC, q.DocEntry DESC
+                """,
+                params,
+            )
+            por_ods: Dict[int, Dict[str, Any]] = {}
+            total_ofertas = 0
+            for r in cursor.fetchall():
+                ods = int(r.callID)
+                grupo = por_ods.setdefault(ods, {
+                    "ods":      ods,
+                    "cliente":  (r.custmrName or "").strip() or None,
+                    "fecha":    r.createDate.date().isoformat() if r.createDate else None,
+                    "asesor":   (r.AsesorName or "").strip() or None,
+                    "ofertas":  [],
+                })
+                grupo["ofertas"].append({
+                    "docEntry":       int(r.DocEntry),
+                    "docNum":         int(r.DocNum),
+                    "fecha":          r.DocDate.date().isoformat() if r.DocDate else None,
+                    "total":          float(r.DocTotal) if r.DocTotal is not None else 0.0,
+                    "lineasAbiertas": int(r.LineasAbiertas or 0),
+                })
+                total_ofertas += 1
+
+            grupos = sorted(por_ods.values(), key=lambda g: g["ods"], reverse=True)
+            return {"success": True, "message": None,
+                    "data": {"grupos": grupos, "totalOfertas": total_ofertas,
+                             "ods": len(grupos)}}
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3) GET /equipment/customer/{card_code} — tarjetas de equipo del cliente
 # ─────────────────────────────────────────────────────────────────────────────
