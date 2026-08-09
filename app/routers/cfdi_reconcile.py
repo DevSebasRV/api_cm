@@ -26,6 +26,12 @@ from app.routers.common import resolve_db, err
 
 router = APIRouter(tags=["Conciliación CFDI"])
 
+# Piso de fechas para TODAS las búsquedas de coincidencias en SAP (pedido del
+# cliente, ago-2026): solo se consideran facturas de proveedor con DocDate del
+# 2026-01-01 en adelante — matches por UUID, candidatas de "Relacionar",
+# facturas sin UUID y los reportes del rango.
+FECHA_PISO = "2026-01-01"
+
 # UUID fiscal completo (formato 8-4-4-4-12 hex). Se busca DENTRO del texto para
 # rescatar los que vienen embebidos en URLs de verificación del SAT.
 _UUID_RE = re.compile(
@@ -93,16 +99,15 @@ def cfdi_reconcile(
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
-            # 1) Facturas SAP con ALGÚN valor de UUID en una ventana amplia
-            #    (dateFrom - 1 año) — el match por UUID no debe depender de la
-            #    fecha de captura en SAP, pero acotamos el escaneo por tamaño.
+            # 1) Facturas SAP con ALGÚN valor de UUID, desde el piso de fechas
+            #    (antes: ventana dateFrom - 1 año).
             cursor.execute(
                 _OPCH_SELECT + """
-                WHERE   OPCH.DocDate >= DATEADD(year, -1, ?)
+                WHERE   OPCH.DocDate >= ?
                   AND ( LTRIM(RTRIM(ISNULL(OPCH.U_CVM_BFOLIOUUID,''))) <> ''
                      OR LTRIM(RTRIM(ISNULL(OPCH.U_UUID,'')))           <> '' )
                 """,
-                [dateFrom],
+                [FECHA_PISO],
             )
             matches: Dict[str, Dict[str, Any]] = {}
             for r in cursor.fetchall():
@@ -115,10 +120,10 @@ def cfdi_reconcile(
                         matches[u] = inv
 
             # 2) TODAS las facturas SAP del rango del reporte (para "sin UUID"
-            #    y "en SAP pero no en la descarga").
+            #    y "en SAP pero no en la descarga"), nunca antes del piso.
             cursor.execute(
-                _OPCH_SELECT + " WHERE OPCH.DocDate >= ? AND OPCH.DocDate <= ?",
-                [dateFrom, dateTo],
+                _OPCH_SELECT + " WHERE OPCH.DocDate >= ? AND OPCH.DocDate >= ? AND OPCH.DocDate <= ?",
+                [FECHA_PISO, dateFrom, dateTo],
             )
             in_range = [_row_to_invoice(r) for r in cursor.fetchall()]
 
@@ -181,7 +186,8 @@ def cfdi_match_candidates(
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
-            # Coincidencia por RFC del proveedor Y total (dentro de la tolerancia).
+            # Coincidencia por RFC del proveedor Y total (dentro de la tolerancia),
+            # solo facturas desde el piso de fechas (antes: sin límite de fecha).
             cursor.execute(
                 f"""
                 SELECT TOP {int(limit)}
@@ -189,10 +195,11 @@ def cfdi_match_candidates(
                        p.DocTotal, p.DocCur, ABS(p.DocTotal - ?) AS Dif
                 FROM   OPCH p JOIN OCRD c ON c.CardCode = p.CardCode
                 WHERE  c.LicTradNum = ? AND p.CANCELED = 'N' AND {_NO_UUID}
+                  AND  p.DocDate >= ?
                   AND  ABS(p.DocTotal - ?) <= ?
                 ORDER BY Dif, p.DocEntry DESC
                 """,
-                [float(total), rfc, float(total), tol],
+                [float(total), rfc, FECHA_PISO, float(total), tol],
             )
             rows = [_view(r) for r in cursor.fetchall()]
 
@@ -235,7 +242,9 @@ def cfdi_uncaptured_invoices(
                   AND  LTRIM(RTRIM(ISNULL(p.U_UUID,''))) = ''
                   AND  o.LicTradNum IS NOT NULL AND LTRIM(RTRIM(o.LicTradNum)) <> ''
                   AND  p.DocDate >= DATEADD(month, -{int(months)}, GETDATE())
+                  AND  p.DocDate >= ?
                 """,
+                [FECHA_PISO],
             )
             invoices = [
                 {"rfc": (r.rfc or "").strip().upper(),
