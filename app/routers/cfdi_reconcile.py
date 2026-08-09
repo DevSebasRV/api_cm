@@ -214,6 +214,92 @@ def cfdi_match_candidates(
         return err(500, f"Error interno: {e}")
 
 
+@router.post(
+    "/cfdiMatchBySerial",
+    summary="Facturas de proveedor (OPCH) que recibieron esos números de serie (motos)",
+)
+def cfdi_match_by_serial(
+    serials:  List[str]      = Body(..., embed=True, description="Números de serie (VIN/NIV) del CFDI"),
+    x_sap_db: Optional[str]  = Header(default=None, alias="X-SAP-DB"),
+):
+    """
+    Para relacionar facturas de MOTOS: el CFDI trae el VIN/NIV de cada unidad y
+    SAP registra los seriales recibidos por factura de compra. La cadena es
+    OSRN (serial: DistNumber=VIN, MnfSerial=motor) → ITL1/OITL (log de
+    transacciones, DocType 18 = factura de proveedor) → OPCH.
+
+    Mismos filtros que las demás candidatas: sin UUID capturado, no cancelada y
+    DocDate desde el piso de fechas. Devuelve qué seriales matchearon en cada
+    factura. Verificado con caso real: VIN VBKTS3403TH705835 → factura #65004.
+    """
+    _, database = resolve_db(x_sap_db)
+    limpios = sorted({s.strip().upper() for s in (serials or []) if s and s.strip()})
+    if not limpios:
+        return {"success": True, "message": None, "data": {"candidates": []}}
+    if len(limpios) > 100:
+        limpios = limpios[:100]
+
+    _NO_UUID = ("LTRIM(RTRIM(ISNULL(p.U_CVM_BFOLIOUUID,''))) = '' "
+                "AND LTRIM(RTRIM(ISNULL(p.U_UUID,''))) = ''")
+    marks = ",".join("?" * len(limpios))
+
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                SELECT DISTINCT
+                       p.DocEntry, p.DocNum, p.CardCode, p.CardName, p.DocDate,
+                       p.DocTotal, p.DocCur, s.DistNumber,
+                       (SELECT COUNT(DISTINCT s2.AbsEntry)
+                        FROM OITL t2
+                        JOIN ITL1 l2 ON l2.LogEntry = t2.LogEntry
+                        JOIN OSRN s2 ON s2.AbsEntry = l2.MdAbsEntry
+                        WHERE t2.DocType = 18 AND t2.DocEntry = p.DocEntry) AS TotalUnidades
+                FROM   OITL t
+                JOIN   ITL1 l ON l.LogEntry = t.LogEntry
+                JOIN   OSRN s ON s.AbsEntry = l.MdAbsEntry
+                JOIN   OPCH p ON p.DocEntry = t.DocEntry
+                WHERE  t.DocType = 18
+                  AND  (s.DistNumber IN ({marks}) OR s.MnfSerial IN ({marks}))
+                  AND  p.CANCELED = 'N' AND {_NO_UUID}
+                  AND  p.DocDate >= ?
+                """,
+                limpios + limpios + [FECHA_PISO],
+            )
+            por_factura: Dict[int, Dict[str, Any]] = {}
+            for r in cursor.fetchall():
+                inv = por_factura.setdefault(int(r.DocEntry), {
+                    "docEntry": int(r.DocEntry),
+                    "docNum":   int(r.DocNum),
+                    "cardCode": r.CardCode,
+                    "cardName": r.CardName,
+                    "docDate":  r.DocDate.date().isoformat() if r.DocDate else None,
+                    "docTotal": float(r.DocTotal) if r.DocTotal is not None else 0.0,
+                    "docCur":   (r.DocCur or "").strip() or None,
+                    # Total de unidades (series) que recibió la factura: si es
+                    # MAYOR a las que ampara el CFDI, la relación sería parcial
+                    # (el campo de UUID es de uno) y el portal la bloquea.
+                    "totalUnidades": int(r.TotalUnidades or 0),
+                    "serials":  [],
+                })
+                serie = (r.DistNumber or "").strip().upper()
+                if serie and serie not in inv["serials"]:
+                    inv["serials"].append(serie)
+
+            candidates = sorted(por_factura.values(),
+                                key=lambda i: (-len(i["serials"]), -i["docEntry"]))
+            return {"success": True, "message": None, "data": {"candidates": candidates}}
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
 @router.get(
     "/cfdiUncapturedInvoices",
     summary="Facturas de proveedor (OPCH) SIN UUID: RFC + total (para marcar filas)",
