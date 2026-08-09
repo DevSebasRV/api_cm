@@ -138,12 +138,17 @@ _ODS_SELECT = """
         T1.ZipCode                                      AS custZip,       -- 19
         T1.LicTradNum                                   AS custRfc,       -- 20
         T0.manufSN                                      AS engineNum,     -- 21
-        T3.U_Ps_Color                                   AS vehColor       -- 22
+        T3.U_Ps_Color                                   AS vehColor,      -- 22
+        -- Asesor de servicio (OSCL.technician → OHEM) y Mecánico/Técnico
+        -- (OSCL.assignee → OUSR). Ver nota de asignaciones en el README.
+        LTRIM(RTRIM(ISNULL(T5.firstName,'') + ' ' + ISNULL(T5.lastName,''))) AS asesorName,  -- 23
+        T6.U_Name                                       AS tecnicoName    -- 24
     FROM OSCL T0
         LEFT JOIN OCRD T1 ON T0.customer   = T1.CardCode
         LEFT JOIN OINS T3 ON T0.insID      = T3.insID
         LEFT JOIN OSCP T4 ON T0.problemTyp = T4.prblmTypID
         LEFT JOIN OHEM T5 ON T0.technician = T5.empID
+        LEFT JOIN OUSR T6 ON T0.assignee   = T6.USERID
     WHERE T0.callID = ?
 """
 
@@ -325,6 +330,14 @@ def create_cm_order(
         _cf("Numero de Serie", payload.get("vin"), "WebVehicleInfo"),
         _cf("Numero de Motor", row0[21],           "WebVehicleInfo"),
         _cf("Color",           row0[22],           "WebVehicleInfo"),
+        # Asesor y Técnico como campos personalizables: los selectores nativos
+        # de CM (assignedToUserID / inChargeUserID) NO se pueden escribir por
+        # API — probado con POST y PATCH, con GUID y con id numérico: responden
+        # 200 y los dejan en null. Así al menos el dato viaja y se ve en CM.
+        # Si el taller no tiene el campo configurado, el reintento de abajo lo
+        # quita y la orden se crea igual.
+        _cf("Asesor de Servicio", row0[23],        "WebVehicleInfo"),
+        _cf("Técnico",            row0[24],        "WebVehicleInfo"),
     ) if c]
     if cfs:
         payload["customizableFields"] = cfs
