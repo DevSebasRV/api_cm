@@ -279,6 +279,7 @@ def _build_article(row, has_img: bool, has_body: bool = False) -> Dict[str, Any]
 )
 def get_articles(
     itemCode: Optional[str] = Query(default=None, description="Código exacto (OITM.ItemCode)."),
+    q:        Optional[str] = Query(default=None, description="Búsqueda parcial por SKU o título."),
     page:     int           = Query(default=1, ge=1),
     pageSize: int           = Query(default=100, ge=1, le=2000),
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
@@ -310,15 +311,25 @@ def get_articles(
                     "articles": { row.ItemCode: _build_article(row, has_img, has_body) },
                 }
 
-            # ── Caso 2: listado paginado (activos + inactivos) ─────────────
-            cursor.execute("SELECT COUNT(*) FROM [@SHOPIFY_ARTICLE]")
+            # ── Caso 2: listado paginado (activos + inactivos), con búsqueda
+            #    parcial opcional por SKU o título (`q`). El título vive en
+            #    U_Name (fallback Name en filas legado / bases sin la columna).
+            where  = ""
+            params: list = []
+            if q and q.strip():
+                name_expr = "ISNULL(U_Name, Name)" if has_name else "Name"
+                where  = f" WHERE (Code LIKE ? OR {name_expr} LIKE ?)"
+                like   = f"%{q.strip()}%"
+                params = [like, like]
+
+            cursor.execute(f"SELECT COUNT(*) FROM [@SHOPIFY_ARTICLE]{where}", params)
             total = cursor.fetchone()[0]
 
             offset = (page - 1) * pageSize
             cursor.execute(
-                select
+                select + where
                 + " ORDER BY Code OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
-                [offset, pageSize],
+                params + [offset, pageSize],
             )
             articles = {
                 row.ItemCode: _build_article(row, has_img, has_body)
