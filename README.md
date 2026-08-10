@@ -20,11 +20,17 @@ app/
     ├── inventory.py         # /inventoryItems (formato ClearMechanic)
     ├── business_partners.py # /businessPartners* (búsqueda, RFC, nextCode, detalle)
     ├── service_calls.py     # /serviceCalls* (listado/detalle/filtro por sucursal),
-    │                        #   catálogos de alta (asesores/mecánicos), stock,
-    │                        #   kits, seriales, códigos de usuario
+    │                        #   catálogos de alta (asesores/mecánicos por Posición),
+    │                        #   documentos ligados, prefactura, stock, kits, seriales
     ├── clearmechanic.py     # /clearmechanic/* (órdenes con campos del formulario
-    │                        #   de CM, citas, inspecciones y sus estimates)
-    ├── cfdi_reconcile.py    # /cfdiReconcile (CFDIs recibidos vs OPCH)
+    │                        #   de CM, citas, inspecciones/estimates, alertas de
+    │                        #   inspección para el Inicio del portal)
+    ├── transfers.py         # /transferRequests* (solicitudes de traslado por ODS
+    │                        #   vía UDF U_ODS + ticket térmico), /transferRequestsOpen
+    │                        #   (abiertas agrupadas por ODS) y /salespersonWarehouses
+    │                        #   (almacenes destino permitidos)
+    ├── cfdi_reconcile.py    # /cfdiReconcile (CFDIs recibidos vs OPCH),
+    │                        #   /cfdiMatchCandidates, /cfdiUncapturedInvoices
     ├── destajo.py           # /destajo, /destajoTecnicos (SP de nómina)
     └── shopify.py           # /shopify/* (artículos con título/HTML/imágenes,
                              #   stock, precios) — con API key
@@ -47,6 +53,27 @@ run.py                   # dev: uvicorn con reload (puerto 8000)
   `OSCL.assignee` guarda un **usuario** (el Mecánico del formulario) y
   `OSCL.technician` un **empleado** (el Asesor de Servicio). El código ya
   respeta esa semántica — no "corregirla" por el nombre de la columna.
+- **Citas de ClearMechanic**: `startDate` se manda como **hora local del
+  taller sin zona horaria** — su API ignora el sufijo `Z` y lee la hora tal
+  cual (el GET de citas, en cambio, sí regresa UTC real). Nunca convertir a
+  UTC al crear.
+- **Documentos ligados a una ODS**: solo por ligas verificables (grilla SCL4
+  de "Registr y Refacciones", líneas con BaseType=191, o marcador "ODS #n" en
+  comentarios). Nunca inferir por cliente+fechas.
+- **Traslados**: la liga con la ODS vive en el UDF `OWTQ.U_ODS` (solo la ponen
+  los creados desde el portal). `OWTQ.Filler` es el almacén **origen** (nombre
+  heredado de SAP) y `ToWhsCode` el destino. El "Empleado del departamento" es
+  `OWTQ.SlpCode`. El almacén de un vendedor es `OSLP.Telephone` (regla
+  CVMSales); los vendedores exentos traen `.`, que no es un almacén real —
+  tratarlo como "sin filtro" en vez de devolver una lista vacía.
+- **Punto de inspección cotizado**: el que ya tiene estimates (`parts` o
+  `labors`) en ClearMechanic, que es lo que escribe el portal al cotizarlo. Las
+  alertas del Inicio solo cuentan los **pendientes**, y recalculan los
+  contadores (los `yellowItemsCount`/`redItemsCount` de CM incluyen los ya
+  cotizados). Hay caché de 90 s por orden: CM limita la tasa de peticiones.
+- **Listas de precios por nombre, no por número**: el mismo catálogo tiene
+  distinto `ListNum` en cada empresa y puede no existir (ej. "Descuentos
+  Boutique" existe en `cp` y no en `fn`). Resolver por `OPLN.ListName`.
 - Español en comentarios, mensajes y commits.
 
 ## Desarrollo
