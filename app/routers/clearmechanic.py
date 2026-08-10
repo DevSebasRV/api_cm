@@ -21,6 +21,7 @@ import datetime
 import json
 import time
 import re
+import threading
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -207,17 +208,105 @@ def _http_patch_json(url: str, payload: dict, headers: Optional[dict] = None):
         return 0, str(e)
 
 
-def _cm_login() -> Optional[str]:
-    """Autentica en CM y devuelve el accessToken (o None)."""
-    status, body = _http_post_json(
-        CM_LOGIN_URL, {"email": CM_USER, "password": CM_PASSWORD}
-    )
-    if status == 200:
+# ─── Token de CM (cacheado) ──────────────────────────────────────────────────
+# El login de CM devuelve expiresIn = 10800 (3 horas). Antes se hacía un login
+# NUEVO en cada petición: eso duplicaba el tráfico contra CM y contribuía a
+# agotar su límite de tasa (HTTP 429 "Rate limit exceeded", que dejaba la
+# pestaña de Inspección sin cargar). Ahora el token se reusa hasta que le
+# queden 5 minutos de vida.
+_TOKEN_CACHE: dict = {"token": None, "exp": 0.0}
+_TOKEN_LOCK = threading.Lock()
+_TOKEN_MARGIN = 300.0          # renovar 5 min antes de que expire
+
+
+def _cm_login(force: bool = False) -> Optional[str]:
+    """accessToken de CM, reusando el cacheado mientras siga vigente.
+    force=True descarta el cacheado (para reintentar tras un 401)."""
+    now = time.time()
+    with _TOKEN_LOCK:
+        if not force and _TOKEN_CACHE["token"] and now < _TOKEN_CACHE["exp"]:
+            return _TOKEN_CACHE["token"]
+
+        status, body = _http_post_json(
+            CM_LOGIN_URL, {"email": CM_USER, "password": CM_PASSWORD}
+        )
+        if status != 200:
+            return None
         try:
-            return json.loads(body).get("accessToken")
+            j = json.loads(body)
         except Exception:
             return None
-    return None
+        token = j.get("accessToken")
+        if not token:
+            return None
+        try:
+            ttl = float(j.get("expiresIn") or 0)
+        except (TypeError, ValueError):
+            ttl = 0.0
+        _TOKEN_CACHE["token"] = token
+        _TOKEN_CACHE["exp"]   = now + max(60.0, (ttl or 3600.0) - _TOKEN_MARGIN)
+        return token
+
+
+# Esperas entre reintentos cuando CM contesta 429 (su límite de tasa).
+_CM_GET_RETRIES = (1.5, 4.0)
+
+
+def _cm_get(url: str, token: Optional[str] = None, retries: tuple = _CM_GET_RETRIES):
+    """GET a CM con reintentos ante 429 y renovación del token ante un 401.
+    Devuelve (status, body), igual que _http_get_json.
+    `retries` son las esperas entre intentos: acórtalo donde se hagan muchas
+    llamadas seguidas (si no, la suma de esperas cuelga la petición)."""
+    tok = token or _cm_login()
+    if not tok:
+        return 0, "No se pudo autenticar en ClearMechanic."
+
+    headers = {"Authorization": f"Bearer {tok}"}
+    status, body = _http_get_json(url, headers)
+
+    if status == 401:                       # token vencido/revocado → uno nuevo
+        nuevo = _cm_login(force=True)
+        if nuevo:
+            headers = {"Authorization": f"Bearer {nuevo}"}
+            status, body = _http_get_json(url, headers)
+
+    for espera in retries:
+        if status != 429:
+            break
+        time.sleep(espera)
+        status, body = _http_get_json(url, headers)
+
+    return status, body
+
+
+# ─── Caché corto de la inspección por orden ──────────────────────────────────
+# Abrir la pestaña "Inspección" de una ODS disparaba un GET a CM cada vez (y el
+# portal la reconsulta al volver a la orden). Con varios asesores trabajando eso
+# agota el límite de tasa de CM. Se cachea la respuesta ya armada por
+# (taller, folio) unos segundos; cualquier escritura sobre esa orden la tira.
+_INSP_CACHE: dict = {}
+_INSP_CACHE_TTL = 60.0
+_INSP_CACHE_LOCK = threading.Lock()
+
+# Contadores de inspección por (taller, folio) para la tarjeta de Inicio.
+# Cada carga de Inicio revisa hasta 40 órdenes en CM: es, por mucho, lo que más
+# consume su límite de tasa. 10 minutos (antes 90s) porque los puntos de
+# inspección no cambian tan seguido Y porque cotizar un punto desde el portal
+# invalida esta caché al instante (_insp_cache_clear), así que el asesor ve su
+# propio cambio sin esperar.
+_INSP_ALERT_CACHE: dict = {}
+_INSP_ALERT_CACHE_TTL = 600.0
+
+
+def _insp_cache_clear(folio) -> None:
+    """Invalida lo cacheado de una orden (tras crear/editar/cotizar un punto),
+    tanto el detalle de la pestaña como los contadores de la tarjeta de Inicio."""
+    f = str(folio)
+    with _INSP_CACHE_LOCK:
+        for k in [k for k in _INSP_CACHE if str(k[1]) == f]:
+            _INSP_CACHE.pop(k, None)
+        for k in [k for k in _INSP_ALERT_CACHE if str(k[1]) == f]:
+            _INSP_ALERT_CACHE.pop(k, None)
 
 
 def _build_order_json(row, phase: str) -> dict:
@@ -539,21 +628,38 @@ def get_cm_inspection(folio: str, repairShopId: int):
     if not CM_USER or not CM_PASSWORD:
         return err(500, "ClearMechanic no está configurado (faltan CM_USER / CM_PASSWORD en .env).")
 
+    # Respuesta reciente ya armada → se sirve sin volver a pegarle a CM.
+    cache_key = (int(repairShopId), str(folio))
+    now = time.time()
+    with _INSP_CACHE_LOCK:
+        hit = _INSP_CACHE.get(cache_key)
+    if hit and now - hit[0] < _INSP_CACHE_TTL:
+        return hit[1]
+
     token = _cm_login()
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
     url = f"{CM_ORDERS_URL}/{urllib.parse.quote(str(folio))}?repairShopId={int(repairShopId)}"
-    status, body = _http_get_json(url, {"Authorization": f"Bearer {token}"})
+    status, body = _cm_get(url, token)
 
     # La orden todavía no está en CM (no sincronizada / sin inspección hecha).
     if status == 404:
-        return {
+        vacio = {
             "success": True, "message": None,
             "data": {"orderNumber": str(folio), "notInCm": True,
                      "inspectionFormStatus": None,
                      "counts": {"green": 0, "yellow": 0, "red": 0}, "items": []},
         }
+        with _INSP_CACHE_LOCK:
+            _INSP_CACHE[cache_key] = (now, vacio)
+        return vacio
+
+    if status == 429:
+        # Se agotó el límite de tasa de CM (ni con reintentos). Mensaje claro:
+        # no es un error del portal y se resuelve solo en unos segundos.
+        return err(429, "ClearMechanic está limitando las consultas en este momento. "
+                        "Espera unos segundos y vuelve a intentar.")
 
     if status not in (200, 201):
         detail = body
@@ -624,7 +730,7 @@ def get_cm_inspection(folio: str, repairShopId: int):
             "labors":         labors,
         })
 
-    return {
+    salida = {
         "success": True, "message": None,
         "data": {
             "orderNumber":          str(data.get("orderNumber") or folio),
@@ -638,6 +744,9 @@ def get_cm_inspection(folio: str, repairShopId: int):
             "items": items,
         },
     }
+    with _INSP_CACHE_LOCK:
+        _INSP_CACHE[cache_key] = (now, salida)
+    return salida
 
 
 def _estimates_for_cm(estimates) -> list:
@@ -697,6 +806,7 @@ def create_inspection_item(
     url = f"{CM_ORDERS_URL}/{urllib.parse.quote(str(folio))}/inspectionItems?workshopId={guid}"
     status, resp = _http_post_json(url, body, {"Authorization": f"Bearer {token}"})
     if status in (200, 201):
+        _insp_cache_clear(folio)          # el punto nuevo debe verse de inmediato
         data = None
         try:
             data = json.loads(resp).get("data")
@@ -749,6 +859,7 @@ def patch_inspection_item(
     url = f"{CM_ORDERS_URL}/{urllib.parse.quote(str(folio))}/inspectionItems/{int(item_id)}?workshopId={guid}"
     status, resp = _http_patch_json(url, body, {"Authorization": f"Bearer {token}"})
     if status in (200, 201, 204):
+        _insp_cache_clear(folio)
         return {"success": True, "message": None}
 
     detail = resp
@@ -808,6 +919,7 @@ def add_inspection_estimates(
 
     if added == 0:
         return err(502, "ClearMechanic rechazó los artículos: " + " | ".join(errors[:3]))
+    _insp_cache_clear(folio)              # el punto ya quedó cotizado
     return {"success": True, "message": None, "added": added, "errors": errors}
 
 
@@ -850,7 +962,7 @@ def replace_inspection_estimates(
 
     # 1) Estimates actuales del punto (la orden v2 trae parts[] y labors[] con id)
     url = f"{CM_API_BASE}/v2/orders/{urllib.parse.quote(str(folio))}?workshopId={guid}"
-    status, resp = _http_get_json(url, headers)
+    status, resp = _cm_get(url, token)
     if status != 200:
         return err(502, f"No se pudo leer la orden en ClearMechanic (HTTP {status}).")
     try:
@@ -890,6 +1002,7 @@ def replace_inspection_estimates(
                 pass
             errors.append(f"{e.get('estimateName') or e.get('partId')}: HTTP {st} {detail}")
 
+    _insp_cache_clear(folio)
     return {"success": True, "message": None,
             "removed": borrados, "added": added, "errors": errors}
 
@@ -965,7 +1078,7 @@ def list_cm_appointments(
     if licensePlate: params["licensePlate"] = licensePlate
 
     url = f"{CM_API_BASE}/appointments?{urllib.parse.urlencode(params)}"
-    st, body = _http_get_json(url, {"Authorization": f"Bearer {token}"})
+    st, body = _cm_get(url, token)
     if st not in (200, 201):
         detail = body
         try:
@@ -1140,7 +1253,7 @@ def list_cm_service_advisors(repairShopId: int):
 
     params = {"workshopId": guid, "role": "ServiceAdvisor", "pageSize": 200}
     url = f"{CM_API_BASE}/users?{urllib.parse.urlencode(params)}"
-    st, body = _http_get_json(url, {"Authorization": f"Bearer {token}"})
+    st, body = _cm_get(url, token)
     if st not in (200, 201):
         detail = body
         try:
@@ -1257,7 +1370,7 @@ def list_cm_custom_reasons(repairShopId: int):
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
     url = f"{CM_API_BASE}/customReasons?workshopId={guid}"
-    st, body = _http_get_json(url, {"Authorization": f"Bearer {token}"})
+    st, body = _cm_get(url, token)
     if st not in (200, 201):
         detail = body
         try:
@@ -1288,11 +1401,6 @@ def list_cm_custom_reasons(repairShopId: int):
             ],
         })
     return {"success": True, "message": None, "data": {"reasons": reasons}}
-
-
-# Caché en memoria de contadores de inspección por (taller, folio) — ver _check.
-_INSP_ALERT_CACHE: dict = {}
-_INSP_ALERT_CACHE_TTL = 90.0
 
 
 @router.get(
@@ -1376,11 +1484,10 @@ def inspection_alerts(
     token = _cm_login()
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
-    headers = {"Authorization": f"Bearer {token}"}
 
     def _check(o):
-        # Caché de 90s por (taller, folio): CM limita la tasa de peticiones
-        # (HTTP 429) y varios asesores recargando el Inicio la agotarían.
+        # Caché por (taller, folio): CM limita la tasa de peticiones (HTTP 429)
+        # y varios asesores recargando el Inicio la agotarían.
         key = (int(repairShopId), o["callId"])
         now = time.time()
         hit = _INSP_ALERT_CACHE.get(key)
@@ -1389,10 +1496,9 @@ def inspection_alerts(
             return {**o, **base} if base else None
 
         url = f"{CM_ORDERS_URL}/{o['callId']}?repairShopId={int(repairShopId)}"
-        status, body = _http_get_json(url, headers)
-        if status == 429:                     # límite de tasa de CM → un reintento
-            time.sleep(1.5)
-            status, body = _http_get_json(url, headers)
+        # Un solo reintento corto: son hasta 40 órdenes, esperar más colgaría
+        # la tarjeta de Inicio. Lo que falle se resuelve en la siguiente carga.
+        status, body = _cm_get(url, token, retries=(1.5,))
         if status == 404:                     # la orden no existe en CM
             _INSP_ALERT_CACHE[key] = (now, None)
             return None
@@ -1442,7 +1548,9 @@ def inspection_alerts(
         _INSP_ALERT_CACHE[key] = (now, base)
         return {**o, **base}
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    # 3 hilos (antes 5): la ráfaga de la tarjeta de Inicio es lo que más consume
+    # el límite de tasa de CM, y con el caché de 90s no hace falta ir tan rápido.
+    with ThreadPoolExecutor(max_workers=3) as pool:
         results = list(pool.map(_check, ods))
 
     alerts = [a for a in results if a]
