@@ -77,16 +77,21 @@ def list_destajo_tecnicos(
         try:
             excl = _codigos_dep_excluidos(cursor)
             marks = ",".join("?" * len(excl))
+            # Se excluyen los usuarios BLOQUEADOS en SAP (OUSR.Locked='Y',
+            # el check "Bloqueado" de Usuarios - Definiciones): ya no operan,
+            # así que no deben ofrecerse para asignar destajo.
             cursor.execute(
                 f"SELECT T0.USERID, T0.USER_CODE, T0.U_NAME "
                 f"FROM OUSR T0 "
                 f"WHERE T0.U_NAME NOT IN ('AV') "
+                f"  AND ISNULL(T0.Locked, 'N') <> 'Y' "
                 f"  AND T0.DEPARTMENT NOT IN ({marks}) "
                 f"ORDER BY T0.U_NAME",
                 excl,
             )
             tecnicos = [
-                {"userId": int(r.USERID), "userCode": r.USER_CODE, "name": (r.U_NAME or "").strip()}
+                {"userId": int(r.USERID), "userCode": (r.USER_CODE or "").strip(),
+                 "name": (r.U_NAME or "").strip()}
                 for r in cursor.fetchall() if (r.U_NAME or "").strip()
             ]
             return {"success": True, "message": None, "tecnicos": tecnicos}
