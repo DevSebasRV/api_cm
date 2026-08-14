@@ -27,8 +27,6 @@ import urllib.error
 import urllib.parse
 import pyodbc
 
-from concurrent.futures import ThreadPoolExecutor
-
 from app.config import EMPRESAS, CM_LOGIN_URL, CM_ORDERS_URL, CM_USER, CM_PASSWORD
 from app.database import get_connection
 from app.routers.common import err, resolve_db
@@ -163,8 +161,36 @@ def _jsonable(v: Any) -> Any:
     return v
 
 
+# ─── Freno de ritmo global hacia ClearMechanic ───────────────────────────────
+# MEDIDO el 12-ago-2026: CM no limita la velocidad instantánea sino el VOLUMEN
+# acumulado en una ventana corta — es una "cubeta" que se rellena a ~1-3
+# peticiones por segundo. Una ráfaga corta pasa (12 seguidas a 16/s: 12 OK),
+# pero al vaciarla TODO devuelve 429 durante ~20-40s, incluso a otro usuario que
+# solo está abriendo una ODS. La ráfaga que la vaciaba era la tarjeta de Inicio
+# (hasta 40 órdenes de golpe con 3 hilos).
+#
+# Este freno serializa TODAS las llamadas salientes a CM: cada una reserva su
+# turno, así nunca se dispara una ráfaga. No retiene el candado mientras duerme,
+# para que varias peticiones concurrentes reserven turnos distintos en vez de
+# quedarse todas esperando al mismo.
+_RITMO_LOCK = threading.Lock()
+_siguiente_turno = 0.0
+_INTERVALO = 0.7                 # ~1.4 peticiones/s en total
+
+
+def _esperar_turno(intervalo: float = _INTERVALO) -> None:
+    global _siguiente_turno
+    with _RITMO_LOCK:
+        turno = max(time.time(), _siguiente_turno)
+        _siguiente_turno = turno + intervalo
+    espera = turno - time.time()
+    if espera > 0:
+        time.sleep(espera)
+
+
 def _http_post_json(url: str, payload: dict, headers: Optional[dict] = None):
     """POST JSON con urllib. Devuelve (status_code, texto_respuesta)."""
+    _esperar_turno()
     data = json.dumps(payload).encode("utf-8")
     h = {"Content-Type": "application/json"}
     if headers:
@@ -181,6 +207,7 @@ def _http_post_json(url: str, payload: dict, headers: Optional[dict] = None):
 
 def _http_get_json(url: str, headers: Optional[dict] = None):
     """GET con urllib. Devuelve (status_code, texto_respuesta)."""
+    _esperar_turno()
     h = dict(headers or {})
     req = urllib.request.Request(url, headers=h, method="GET")
     try:
@@ -194,6 +221,7 @@ def _http_get_json(url: str, headers: Optional[dict] = None):
 
 def _http_patch_json(url: str, payload: dict, headers: Optional[dict] = None):
     """PATCH JSON con urllib. Devuelve (status_code, texto_respuesta)."""
+    _esperar_turno()
     data = json.dumps(payload).encode("utf-8")
     h = {"Content-Type": "application/json"}
     if headers:
@@ -287,6 +315,39 @@ def _cm_get(url: str, token: Optional[str] = None, retries: tuple = _CM_GET_RETR
 _INSP_CACHE: dict = {}
 _INSP_CACHE_TTL = 60.0
 _INSP_CACHE_LOCK = threading.Lock()
+
+# Cuántas órdenes NUEVAS se consultan durante la carga de la tarjeta de Inicio.
+# El resto se refresca en segundo plano: así la pantalla no espera y, sobre
+# todo, no se dispara una ráfaga contra CM.
+_ALERTS_POR_CARGA = 5
+
+# Talleres con un refresco de fondo en curso (para no lanzar dos a la vez).
+_REFRESCO_LOCK = threading.Lock()
+_refrescando: set = set()
+
+
+def _lanzar_refresco(shop: int, ods: list, consultar) -> None:
+    """Refresca en segundo plano los contadores que faltan, uno por uno y con
+    un respiro entre cada uno para dejarle cupo de CM a lo interactivo."""
+    with _REFRESCO_LOCK:
+        if shop in _refrescando:
+            return
+        _refrescando.add(shop)
+
+    def _correr():
+        try:
+            for o in ods:
+                try:
+                    consultar(o)
+                except Exception:
+                    pass          # una orden que falle no debe cortar el resto
+                time.sleep(1.0)
+        finally:
+            with _REFRESCO_LOCK:
+                _refrescando.discard(shop)
+
+    threading.Thread(target=_correr, daemon=True).start()
+
 
 # Contadores de inspección por (taller, folio) para la tarjeta de Inicio.
 # Cada carga de Inicio revisa hasta 40 órdenes en CM: es, por mucho, lo que más
@@ -925,6 +986,7 @@ def add_inspection_estimates(
 
 def _http_delete(url: str, headers: Optional[dict] = None):
     """DELETE con urllib. Devuelve (status_code, texto_respuesta)."""
+    _esperar_turno()
     req = urllib.request.Request(url, headers=headers or {}, method="DELETE")
     try:
         with urllib.request.urlopen(req, timeout=45) as r:
@@ -1480,24 +1542,25 @@ def inspection_alerts(
         return {"success": True, "message": None,
                 "data": {"alerts": [], "checked": 0}}
 
-    # ── 2) Contadores de inspección por orden en CM (en paralelo) ───────────
+    # ── 2) Contadores de inspección por orden en CM ─────────────────────────
     token = _cm_login()
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
-    def _check(o):
-        # Caché por (taller, folio): CM limita la tasa de peticiones (HTTP 429)
-        # y varios asesores recargando el Inicio la agotarían.
+    def _en_cache(call_id):
+        """(hay_dato, valor). valor None = ya revisada y SIN alertas."""
+        hit = _INSP_ALERT_CACHE.get((int(repairShopId), call_id))
+        if hit and time.time() - hit[0] < _INSP_ALERT_CACHE_TTL:
+            return True, hit[1]
+        return False, None
+
+    def _consultar(o):
+        """Pregunta a CM por UNA orden y cachea el resultado."""
         key = (int(repairShopId), o["callId"])
         now = time.time()
-        hit = _INSP_ALERT_CACHE.get(key)
-        if hit and now - hit[0] < _INSP_ALERT_CACHE_TTL:
-            base = hit[1]
-            return {**o, **base} if base else None
-
         url = f"{CM_ORDERS_URL}/{o['callId']}?repairShopId={int(repairShopId)}"
-        # Un solo reintento corto: son hasta 40 órdenes, esperar más colgaría
-        # la tarjeta de Inicio. Lo que falle se resuelve en la siguiente carga.
+        # Un solo reintento corto: lo que falle se resuelve en la siguiente
+        # pasada del refresco de fondo, no vale la pena esperar aquí.
         status, body = _cm_get(url, token, retries=(1.5,))
         if status == 404:                     # la orden no existe en CM
             _INSP_ALERT_CACHE[key] = (now, None)
@@ -1548,13 +1611,35 @@ def inspection_alerts(
         _INSP_ALERT_CACHE[key] = (now, base)
         return {**o, **base}
 
-    # 3 hilos (antes 5): la ráfaga de la tarjeta de Inicio es lo que más consume
-    # el límite de tasa de CM, y con el caché de 90s no hace falta ir tan rápido.
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        results = list(pool.map(_check, ods))
+    # ── 3) Servir de caché + refrescar el resto en segundo plano ────────────
+    # ANTES esto pedía hasta 40 órdenes de golpe con 3 hilos (~16 peticiones/s):
+    # esa ráfaga vaciaba el cupo de CM y dejaba a TODOS con 429 durante medio
+    # minuto — incluido el asesor que solo abría la pestaña de Inspección de una
+    # ODS. Ahora lo cacheado sale al instante, se consultan unas pocas nuevas y
+    # las demás se refrescan despacio por detrás, sin hacer esperar a nadie.
+    alerts     = []
+    pendientes = []
+    for o in ods:
+        hay, base = _en_cache(o["callId"])
+        if hay:
+            if base:
+                alerts.append({**o, **base})
+        else:
+            pendientes.append(o)
 
-    alerts = [a for a in results if a]
+    for o in pendientes[:_ALERTS_POR_CARGA]:
+        alerta = _consultar(o)
+        if alerta:
+            alerts.append(alerta)
+
+    resto = pendientes[_ALERTS_POR_CARGA:]
+    if resto:
+        _lanzar_refresco(int(repairShopId), resto, _consultar)
+
     alerts.sort(key=lambda a: a.get("lastUpdatedTime") or "", reverse=True)
 
+    # `pendientes` = órdenes que aún no se han revisado en esta ronda; aparecerán
+    # en las siguientes cargas conforme el refresco de fondo las vaya llenando.
     return {"success": True, "message": None,
-            "data": {"alerts": alerts, "checked": len(ods)}}
+            "data": {"alerts": alerts, "checked": len(ods),
+                     "pendientes": len(resto)}}
