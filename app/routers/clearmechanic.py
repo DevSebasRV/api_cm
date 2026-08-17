@@ -428,8 +428,14 @@ def _lanzar_refresco(shop: int, ods: list, consultar) -> None:
 # inspección no cambian tan seguido Y porque cotizar un punto desde el portal
 # invalida esta caché al instante (_insp_cache_clear), así que el asesor ve su
 # propio cambio sin esperar.
+# Guarda (cuándo_caduca, valor). El TTL es distinto según el caso, ver abajo.
 _INSP_ALERT_CACHE: dict = {}
-_INSP_ALERT_CACHE_TTL = 600.0
+_INSP_ALERT_CACHE_TTL = 600.0            # 10 min: la orden SÍ está en CM
+
+# 6 horas para las órdenes que NO están en CM: eso no cambia por sí solo y era
+# el 93% de las consultas del refresco de fondo (65 de 70, medido en el
+# Monitor). Si la orden se envía a CM, su caché se invalida en ese momento.
+_INSP_NO_EN_CM_TTL = 6 * 3600.0
 
 
 def _insp_cache_clear(folio) -> None:
@@ -1635,7 +1641,7 @@ def inspection_alerts(
     def _en_cache(call_id):
         """(hay_dato, valor). valor None = ya revisada y SIN alertas."""
         hit = _INSP_ALERT_CACHE.get((int(repairShopId), call_id))
-        if hit and time.time() - hit[0] < _INSP_ALERT_CACHE_TTL:
+        if hit and time.time() < hit[0]:      # hit[0] = cuándo caduca
             return True, hit[1]
         return False, None
 
@@ -1647,8 +1653,13 @@ def inspection_alerts(
         # Un solo reintento corto: lo que falle se resuelve en la siguiente
         # pasada del refresco de fondo, no vale la pena esperar aquí.
         status, body = _cm_get(url, token, retries=(1.5,), shop=repairShopId)
-        if status == 404:                     # la orden no existe en CM
-            _INSP_ALERT_CACHE[key] = (now, None)
+        if status == 404:
+            # La orden NO está en CM (nunca se envió, o es anterior a la
+            # integración). Esto no cambia solo, así que se recuerda por horas:
+            # medido en el Monitor, 65 de 70 consultas del refresco de fondo
+            # eran justo esto, repetidas cada 10 min. Si la orden se llega a
+            # enviar a CM, create_cm_order invalida su caché al instante.
+            _INSP_ALERT_CACHE[key] = (now + _INSP_NO_EN_CM_TTL, None)
             return None
         if status != 200:                     # error puntual: no cachear
             return None
@@ -1656,9 +1667,10 @@ def inspection_alerts(
             data = json.loads(body).get("data", {}) or {}
         except Exception:
             return None
-        # Salida rápida: la orden no tiene ningún punto rojo/amarillo.
+        # Salida rápida: la orden no tiene ningún punto rojo/amarillo. Aquí SÍ
+        # se usa el TTL corto: en cualquier momento le pueden agregar puntos.
         if int(data.get("yellowItemsCount") or 0) + int(data.get("redItemsCount") or 0) == 0:
-            _INSP_ALERT_CACHE[key] = (now, None)
+            _INSP_ALERT_CACHE[key] = (now + _INSP_ALERT_CACHE_TTL, None)
             return None
 
         # Solo alertan los puntos rojos/amarillos que FALTA COTIZAR: en CM un
@@ -1688,12 +1700,12 @@ def inspection_alerts(
                            "color": color})
 
         if yellow + red == 0:                 # todos los puntos ya están cotizados
-            _INSP_ALERT_CACHE[key] = (now, None)
+            _INSP_ALERT_CACHE[key] = (now + _INSP_ALERT_CACHE_TTL, None)
             return None
 
         base = {"yellow": yellow, "red": red, "points": points,
                 "lastUpdatedTime": data.get("lastUpdatedTime")}
-        _INSP_ALERT_CACHE[key] = (now, base)
+        _INSP_ALERT_CACHE[key] = (now + _INSP_ALERT_CACHE_TTL, base)
         return {**o, **base}
 
     # ── 3) Servir de caché + refrescar el resto en segundo plano ────────────
