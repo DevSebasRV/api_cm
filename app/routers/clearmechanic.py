@@ -1800,11 +1800,28 @@ def cm_metrics(hours: int = 24, bucketMin: int = 60):
                   f"FROM cm_requests WHERE ts >= ? "
                   f"GROUP BY 1 ORDER BY 1", [desde])
 
+        # Cruces para el detalle del Monitor: al abrir una barra se muestran las
+        # cuentas EXACTAS, no proporciones aproximadas.
+        cruce = q(f"SELECT origen, shop, COUNT(*) AS total, {cortes} "
+                  f"FROM cm_requests WHERE ts >= ? "
+                  f"GROUP BY origen, shop ORDER BY total DESC", [desde])
+
+        # Recursos de CM tocados y códigos de error, por origen y por sucursal.
+        recursos = q(f"SELECT origen, shop, recurso, metodo, COUNT(*) AS total, {cortes}, "
+                     f"CAST(AVG(ms) AS INTEGER) AS ms_prom "
+                     f"FROM cm_requests WHERE ts >= ? "
+                     f"GROUP BY origen, shop, recurso, metodo ORDER BY total DESC", [desde])
+
+        errores = q("SELECT origen, shop, status, COUNT(*) AS n FROM cm_requests "
+                    "WHERE ts >= ? AND status NOT BETWEEN 200 AND 299 AND status <> 404 "
+                    "GROUP BY origen, shop, status ORDER BY n DESC", [desde])
+
         conn.close()
         return {"success": True, "message": None,
                 "data": {"hours": hours, "bucketMin": bucket // 60,
                          "totales": totales, "porStatus": por_status,
                          "porOrigen": por_origen,
-                         "porSucursal": por_sucursal, "serie": serie}}
+                         "porSucursal": por_sucursal, "serie": serie,
+                         "cruce": cruce, "recursos": recursos, "errores": errores}}
     except Exception as e:
         return err(500, f"No se pudieron leer las métricas: {e}")
