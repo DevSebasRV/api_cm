@@ -1721,7 +1721,9 @@ def inspection_alerts(
     if resto:
         _lanzar_refresco(int(repairShopId), resto, _consultar)
 
-    alerts.sort(key=lambda a: a.get("lastUpdatedTime") or "", reverse=True)
+    # De la ODS más nueva a la más vieja, por FECHA DE LA ORDEN (pedido del
+    # cliente; antes era por última actualización de la inspección en CM).
+    alerts.sort(key=lambda a: (a.get("fecha") or "", a.get("callId") or 0), reverse=True)
 
     # `pendientes` = órdenes que aún no se han revisado en esta ronda; aparecerán
     # en las siguientes cargas conforme el refresco de fondo las vaya llenando.
@@ -1754,32 +1756,43 @@ def cm_metrics(hours: int = 24, bucketMin: int = 60):
             cols = [c[0] for c in cur.description]
             return [dict(zip(cols, r)) for r in cur.fetchall()]
 
-        ok_429_502 = ("SUM(CASE WHEN status BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS ok, "
-                      "SUM(CASE WHEN status = 429 THEN 1 ELSE 0 END) AS e429, "
-                      "SUM(CASE WHEN status = 429 OR status BETWEEN 200 AND 299 "
-                      "         THEN 0 ELSE 1 END) AS otros")
+        # El 404 se separa: en la revisión de alertas significa "la orden no
+        # está en CM", que es normal — meterlo en "errores" infla el número y
+        # confunde. `otros` queda SOLO con errores reales (0, 401, 5xx, ...).
+        cortes = ("SUM(CASE WHEN status BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS ok, "
+                  "SUM(CASE WHEN status = 429 THEN 1 ELSE 0 END) AS e429, "
+                  "SUM(CASE WHEN status = 404 THEN 1 ELSE 0 END) AS e404, "
+                  "SUM(CASE WHEN status BETWEEN 200 AND 299 OR status IN (404, 429) "
+                  "         THEN 0 ELSE 1 END) AS otros")
 
-        totales = q(f"SELECT COUNT(*) AS total, {ok_429_502}, "
+        totales = q(f"SELECT COUNT(*) AS total, {cortes}, "
                     f"CAST(AVG(ms) AS INTEGER) AS ms_prom "
                     f"FROM cm_requests WHERE ts >= ?", [desde])[0]
 
-        por_origen = q(f"SELECT origen, COUNT(*) AS total, {ok_429_502} "
+        # Códigos EXACTOS de los errores reales (para nombrarlos en el Monitor).
+        por_status = q("SELECT status, COUNT(*) AS n FROM cm_requests "
+                       "WHERE ts >= ? AND status NOT BETWEEN 200 AND 299 "
+                       "  AND status NOT IN (404, 429) "
+                       "GROUP BY status ORDER BY n DESC", [desde])
+
+        por_origen = q(f"SELECT origen, COUNT(*) AS total, {cortes} "
                        f"FROM cm_requests WHERE ts >= ? "
                        f"GROUP BY origen ORDER BY total DESC", [desde])
 
-        por_sucursal = q(f"SELECT shop, COUNT(*) AS total, {ok_429_502} "
+        por_sucursal = q(f"SELECT shop, COUNT(*) AS total, {cortes} "
                          f"FROM cm_requests WHERE ts >= ? "
                          f"GROUP BY shop ORDER BY total DESC", [desde])
 
         serie = q(f"SELECT CAST(ts / {bucket} AS INTEGER) * {bucket} AS t, "
-                  f"COUNT(*) AS total, {ok_429_502} "
+                  f"COUNT(*) AS total, {cortes} "
                   f"FROM cm_requests WHERE ts >= ? "
                   f"GROUP BY 1 ORDER BY 1", [desde])
 
         conn.close()
         return {"success": True, "message": None,
                 "data": {"hours": hours, "bucketMin": bucket // 60,
-                         "totales": totales, "porOrigen": por_origen,
+                         "totales": totales, "porStatus": por_status,
+                         "porOrigen": por_origen,
                          "porSucursal": por_sucursal, "serie": serie}}
     except Exception as e:
         return err(500, f"No se pudieron leer las métricas: {e}")

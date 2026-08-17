@@ -226,6 +226,97 @@ def list_open_transfer_requests(
 
 
 @router.get(
+    "/transfersDone",
+    summary="Traslados REALIZADOS (OWTR) rastreables a una ODS",
+)
+def list_transfers_done(
+    ods:      Optional[int] = None,
+    sucursal: Optional[str] = None,
+    limit:    int = 100,
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """Traslados de stock ya ejecutados (OWTR) ligados a una ODS por dos vías:
+    su propio U_ODS (SAP lo copia a veces al crear desde la solicitud) o la
+    solicitud base (WTR1.BaseType=1250000001 → OWTQ.U_ODS). Con `ods` se filtra
+    a esa orden (pestaña de la ODS); sin él se listan los recientes (módulo
+    Traslados), opcionalmente acotados a la `sucursal` del asesor de la ODS."""
+    _, database = resolve_db(x_sap_db)
+    limit = max(1, min(int(limit), 300))
+
+    filtros = ""
+    params: List[Any] = []
+    if ods is not None:
+        filtros += " AND COALESCE(NULLIF(LTRIM(RTRIM(t.U_ODS)), ''), b.U_ODS) = ?"
+        params.append(str(ods))
+    if sucursal and sucursal.strip():
+        filtros += (" AND c.technician IN (SELECT h.empID FROM OHEM h "
+                    "JOIN OUBR br ON br.Code = h.branch WHERE br.Name = ?)")
+        params.append(sucursal.strip())
+
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                SELECT  TOP {limit}
+                        t.DocEntry, t.DocNum, t.DocDate,
+                        s.SlpName,
+                        t.Filler    AS FromWhs,
+                        wf.WhsName  AS FromWhsName,
+                        t.ToWhsCode AS ToWhs,
+                        wt.WhsName  AS ToWhsName,
+                        (SELECT COUNT(*) FROM WTR1 x WHERE x.DocEntry = t.DocEntry) AS Lineas,
+                        COALESCE(NULLIF(LTRIM(RTRIM(t.U_ODS)), ''), b.U_ODS) AS Ods,
+                        b.SolicitudNum,
+                        c.custmrName AS OdsCliente
+                FROM    OWTR t
+                OUTER   APPLY (
+                            SELECT TOP 1 q.U_ODS, q.DocNum AS SolicitudNum
+                            FROM   WTR1 l
+                            JOIN   OWTQ q ON q.DocEntry = l.BaseEntry
+                            WHERE  l.DocEntry = t.DocEntry
+                              AND  l.BaseType = 1250000001
+                              AND  ISNULL(q.U_ODS, '') <> ''
+                        ) b
+                LEFT    JOIN OSLP s  ON s.SlpCode  = t.SlpCode
+                LEFT    JOIN OWHS wf ON wf.WhsCode = t.Filler
+                LEFT    JOIN OWHS wt ON wt.WhsCode = t.ToWhsCode
+                LEFT    JOIN OSCL c  ON CAST(c.callID AS NVARCHAR(20)) =
+                                        COALESCE(NULLIF(LTRIM(RTRIM(t.U_ODS)), ''), b.U_ODS)
+                WHERE   COALESCE(NULLIF(LTRIM(RTRIM(t.U_ODS)), ''), b.U_ODS) IS NOT NULL
+                  {filtros}
+                ORDER BY t.DocEntry DESC
+                """,
+                params,
+            )
+            traslados = [
+                {
+                    "docEntry":     int(r.DocEntry),
+                    "docNum":       int(r.DocNum),
+                    "fecha":        r.DocDate.date().isoformat() if r.DocDate else None,
+                    "ods":          int(r.Ods) if (r.Ods or "").strip().isdigit() else None,
+                    "cliente":      (r.OdsCliente or "").strip() or None,
+                    "solicitudNum": int(r.SolicitudNum) if r.SolicitudNum else None,
+                    "fromWhs":      {"code": (r.FromWhs or "").strip(), "name": (r.FromWhsName or "").strip() or None},
+                    "toWhs":        {"code": (r.ToWhs or "").strip(),   "name": (r.ToWhsName or "").strip() or None},
+                    "vendedor":     (r.SlpName or "").strip() or None,
+                    "lineas":       int(r.Lineas or 0),
+                }
+                for r in cursor.fetchall()
+            ]
+            return {"success": True, "message": None,
+                    "data": {"traslados": traslados, "total": len(traslados)}}
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+    except Exception as e:
+        return err(500, f"Error interno: {e}")
+
+
+@router.get(
     "/transferRequests/{doc_entry}/ticket",
     summary="Datos del ticket térmico de una solicitud de traslado",
 )
