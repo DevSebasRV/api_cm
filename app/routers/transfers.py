@@ -9,6 +9,7 @@ es el destino.
 
 from fastapi import APIRouter, Header
 from typing import Optional, Any, Dict, List
+import re
 import pyodbc
 
 from app.database import get_connection
@@ -17,6 +18,16 @@ from app.routers.common import resolve_db, err
 router = APIRouter(tags=["Traslados"])
 
 _STATUS = {"O": "Abierta", "C": "Cerrada"}
+
+# SAP arma OSLP.SlpName como "CODIGO .- Nombre de la persona" (el separador
+# varía: '.-', '.- ', ' .-'). Quitando ese prefijo quedan agrupados los varios
+# códigos de vendedor de un mismo asesor, que es como se sabe cuáles almacenes
+# son suyos.
+_PREFIJO_CODIGO = re.compile(r"^\s*\S+\s*\.-\s*")
+
+
+def _persona_de_slpname(slp_name: Optional[str]) -> str:
+    return _PREFIJO_CODIGO.sub("", (slp_name or "").strip()).strip().lower()
 
 
 def _estatus(doc_status: Optional[str], canceled: Optional[str]) -> str:
@@ -84,41 +95,68 @@ def list_transfer_requests(
 
 @router.get(
     "/salespersonWarehouses",
-    summary="Almacenes de la sucursal del vendedor (destino permitido de un traslado)",
+    summary="Almacenes del asesor (destino permitido de un traslado)",
 )
 def salesperson_warehouses(
     slpCode: int,
     x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
 ):
-    """Almacenes que comparten localidad (OLCT) con el almacén del vendedor
-    (OSLP.Telephone, la regla CVMSales). Se usan como DESTINO del traslado.
+    """Almacenes DEL ASESOR, para el destino del traslado.
 
-    Si el vendedor no tiene almacén válido (los exentos traen '.'), se devuelven
-    TODOS los almacenes: es preferible no filtrar a dejar la lista vacía y
-    bloquear el traslado."""
+    Un mismo asesor tiene VARIOS códigos de vendedor en OSLP —uno por marca— y
+    cada uno con su almacén en `OSLP.Telephone` (verificado: es el campo que
+    manda; el "Almacén origen" de esa ventana de SAP es `Email` y no lo usa
+    ningún documento). Ej.: Christian Dominguez tiene 5 códigos → 4 almacenes
+    (BRPSERV, KTMSERV, YASERPAT, YASERV). 46 asesores tienen más de uno.
+
+    Los códigos se agrupan por el NOMBRE de la persona, quitando el prefijo
+    "CODIGO .-" con el que SAP arma SlpName. No hay forma mejor: `OSLP.EmpID`
+    (el enlace a Datos maestros de empleado) está en CERO en los 274 vendedores.
+
+    Antes se devolvían todos los almacenes de la LOCALIDAD (27 para Satélite,
+    con boutique y bodegas incluidas). Si el asesor no tiene ninguno (exento con
+    '.'), se devuelven todos: mejor no filtrar que dejarlo trabado."""
     _, database = resolve_db(x_sap_db)
     try:
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
-            cursor.execute(
-                """
-                SELECT  w.WhsCode, w.WhsName, ISNULL(l.Location, '') AS Location
-                FROM    OWHS w
-                LEFT    JOIN OLCT l ON l.Code = w.Location
-                WHERE   w.Location = (
-                            SELECT TOP 1 w2.Location FROM OWHS w2
-                            WHERE  w2.WhsCode = (SELECT TOP 1 LTRIM(RTRIM(Telephone))
-                                                 FROM OSLP WHERE SlpCode = ?)
-                        )
-                ORDER BY w.WhsName
-                """,
-                [slpCode],
-            )
-            rows = cursor.fetchall()
-            filtrado = True
-            if not rows:                      # vendedor exento / sin almacén
-                filtrado = False
+            # Nombre de la persona detrás del código elegido.
+            cursor.execute("SELECT SlpName FROM OSLP WHERE SlpCode = ?", [slpCode])
+            fila = cursor.fetchone()
+            persona = _persona_de_slpname(fila.SlpName if fila else "")
+
+            # Sus almacenes = los de TODOS sus códigos de vendedor. El match por
+            # nombre se hace en Python (SQL Server no normaliza acentos igual).
+            codigos = []
+            if persona:
+                cursor.execute(
+                    "SELECT SlpName, LTRIM(RTRIM(ISNULL(Telephone,''))) AS Whs "
+                    "FROM OSLP WHERE ISNULL(Active,'Y') = 'Y' AND SlpCode >= 0"
+                )
+                codigos = [
+                    r.Whs for r in cursor.fetchall()
+                    if r.Whs and r.Whs != "." and _persona_de_slpname(r.SlpName) == persona
+                ]
+
+            rows = []
+            if codigos:
+                unicos = sorted(set(codigos))
+                marcas = ",".join("?" * len(unicos))
+                cursor.execute(
+                    f"""
+                    SELECT  w.WhsCode, w.WhsName, ISNULL(l.Location, '') AS Location
+                    FROM    OWHS w
+                    LEFT    JOIN OLCT l ON l.Code = w.Location
+                    WHERE   w.WhsCode IN ({marcas})
+                    ORDER BY w.WhsName
+                    """,
+                    unicos,
+                )
+                rows = cursor.fetchall()
+
+            filtrado = bool(rows)
+            if not rows:                      # asesor exento / sin almacenes
                 cursor.execute(
                     "SELECT w.WhsCode, w.WhsName, ISNULL(l.Location,'') AS Location "
                     "FROM OWHS w LEFT JOIN OLCT l ON l.Code = w.Location ORDER BY w.WhsName"

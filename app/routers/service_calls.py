@@ -23,6 +23,7 @@ from fastapi import APIRouter, Header, Query
 from typing import Optional, Dict, Any, List
 import datetime
 import re
+import unicodedata
 import pyodbc
 
 from app.config import PRICE_LIST_CODE
@@ -1646,7 +1647,18 @@ def quote_article_search(
         WHERE  ISNULL(OITM.Canceled,'N') = 'N'
           AND  ISNULL(OITM.SellItem,'Y') = 'Y'
           AND  {clause}
-        ORDER BY OITM.ItemCode
+        -- Primero lo que SÍ hay: existencia en el almacén del vendedor, luego en
+        -- el general, y hasta el final lo que está en cero en ambos. El TOP se
+        -- aplica DESPUÉS de ordenar, así que los 25 que se devuelven ya son los
+        -- disponibles (antes se tomaban los 25 primeros por código y salían
+        -- puros ceros arriba).
+        ORDER BY
+            CASE WHEN ISNULL(OITW.OnHand, 0) > 0 THEN 0
+                 WHEN ISNULL(OITM.OnHand, 0) > 0 THEN 1
+                 ELSE 2 END,
+            ISNULL(OITW.OnHand, 0) DESC,
+            ISNULL(OITM.OnHand, 0) DESC,
+            OITM.ItemCode
     """
     try:
         conn   = get_connection(database)
@@ -1857,5 +1869,91 @@ def salesperson_search(
             cursor.close()
             conn.close()
         return {"success": True, "salespeople": salespeople}
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+
+
+# La SUCURSAL del usuario (OUBR.Name, vía OHEM) y la LOCALIDAD del almacén del
+# vendedor (OLCT.Location) viven en tablas distintas y NO se llaman igual. Con
+# comparar los nombres tal cual, los usuarios de "Miramontes_Sur" (8 en el
+# portal) se quedarían sin vendedores. Este mapa traduce OUBR → OLCT; lo que no
+# esté aquí simplemente no filtra (se devuelven todos, agrupados).
+_SUCURSAL_A_LOCALIDAD = {
+    "satelite":       "Satélite",
+    "patriotismo":    "Patriotismo",
+    "tonala":         "Tonala",
+    "aeropuerto":     "Aeropuerto",
+    "miramontes_sur": "Sur (Miramontes)",
+    "zona sur":       "Sur (Miramontes)",
+}
+
+
+def _norm_txt(s: str) -> str:
+    """minúsculas y sin acentos, para comparar nombres de sucursal."""
+    s = unicodedata.normalize("NFD", (s or "").strip().lower())
+    return "".join(c for c in s if unicodedata.category(c) != "Mn")
+
+
+@router.get(
+    "/salespersons",
+    summary="Vendedores activos con su almacén y sucursal (para el selector de la oferta)",
+)
+def salespersons(
+    sucursal: Optional[str] = Query(default=None, description="Sucursal del usuario (OUBR.Name)"),
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """Lista completa de vendedores activos con almacén válido, anotada con su
+    localidad y si el almacén es de SERVICIO (o llantera). El portal la usa para
+    armar un selector agrupado, en vez de obligar a escribir para buscar.
+
+    No filtra por sucursal: devuelve todos con su localidad para que el portal
+    ponga arriba los de la del usuario. `sucursalResuelta` dice a qué localidad
+    se tradujo la sucursal recibida (None si no se pudo, y entonces el portal
+    los muestra todos sin destacar ninguno)."""
+    _, database = resolve_db(x_sap_db)
+    localidad = _SUCURSAL_A_LOCALIDAD.get(_norm_txt(sucursal)) if sucursal else None
+
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT  s.SlpCode, s.SlpName,
+                        LTRIM(RTRIM(ISNULL(s.Telephone,''))) AS Tel,
+                        w.WhsCode, w.WhsName,
+                        ISNULL(l.Location, '') AS Localidad
+                FROM    OSLP s
+                LEFT    JOIN OWHS w ON w.WhsCode = LTRIM(RTRIM(s.Telephone))
+                LEFT    JOIN OLCT l ON l.Code = w.Location
+                WHERE   ISNULL(s.Active,'Y') = 'Y'
+                  AND   s.SlpCode >= 0
+                ORDER BY s.SlpName
+                """
+            )
+            vendedores = []
+            for r in cursor.fetchall():
+                tel    = (r.Tel or "").strip()
+                exento = "." in tel
+                whs    = (r.WhsCode or "").strip() or None
+                nombre_whs = (r.WhsName or "").strip() or None
+                # Servicio y llantera son los almacenes desde los que se cotiza
+                # servicio (verificado con 6 meses de ofertas reales).
+                n = _norm_txt(nombre_whs or "")
+                es_servicio = ("servicio" in n) or ("llanter" in n)
+                vendedores.append({
+                    "SlpCode":       int(r.SlpCode),
+                    "SlpName":       (r.SlpName or "").strip(),
+                    "Warehouse":     None if exento else whs,
+                    "WarehouseName": nombre_whs,
+                    "Exempt":        exento,
+                    "Sucursal":      (r.Localidad or "").strip() or None,
+                    "EsServicio":    es_servicio,
+                })
+        finally:
+            cursor.close()
+            conn.close()
+        return {"success": True, "vendedores": vendedores,
+                "sucursalResuelta": localidad}
     except pyodbc.Error as db_err:
         return err(500, f"Error de SAP B1: {db_err}")
