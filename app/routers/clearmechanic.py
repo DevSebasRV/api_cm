@@ -27,7 +27,10 @@ import urllib.error
 import urllib.parse
 import pyodbc
 
-from app.config import EMPRESAS, CM_LOGIN_URL, CM_ORDERS_URL, CM_USER, CM_PASSWORD
+import sqlite3
+
+from app.config import (EMPRESAS, CM_LOGIN_URL, CM_ORDERS_URL, CM_USER,
+                        CM_PASSWORD, CM_ACCOUNTS, CM_METRICS_DB)
 from app.database import get_connection
 from app.routers.common import err, resolve_db
 
@@ -161,6 +164,76 @@ def _jsonable(v: Any) -> Any:
     return v
 
 
+# ─── Observabilidad: bitácora de peticiones salientes a CM ───────────────────
+# Cada llamada HTTP a ClearMechanic se registra en SQLite: cuándo, desde qué
+# parte del portal (origen), de qué sucursal, con qué resultado y cuánto tardó.
+# Sirve para el módulo "Monitor ClearMechanic" del portal: ver qué consume el
+# límite de tasa y de dónde sale. Retención: 14 días.
+_METRICA_LOCAL = threading.local()          # origen/sucursal de la petición en curso
+_METRICS_LOCK = threading.Lock()
+_metrics_listo = False
+
+
+def _origen(nombre: str, shop=None) -> None:
+    """Etiqueta las llamadas a CM que haga ESTE hilo (se pone al entrar a cada
+    endpoint). Los hilos de fondo deben llamarla ellos mismos."""
+    _METRICA_LOCAL.origen = nombre
+    _METRICA_LOCAL.shop = int(shop) if shop else None
+
+
+def _metrics_conn():
+    global _metrics_listo
+    conn = sqlite3.connect(CM_METRICS_DB, timeout=5)
+    if not _metrics_listo:
+        with _METRICS_LOCK:
+            conn.execute("""CREATE TABLE IF NOT EXISTS cm_requests (
+                ts      REAL NOT NULL,
+                origen  TEXT,
+                shop    INTEGER,
+                recurso TEXT,
+                metodo  TEXT,
+                status  INTEGER,
+                ms      INTEGER)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_cm_requests_ts ON cm_requests(ts)")
+            conn.commit()
+            _metrics_listo = True
+    return conn
+
+
+def _recurso_de_url(url: str, metodo: str) -> str:
+    """Clasifica la URL de CM en un recurso legible (por si falta el origen)."""
+    if "/users/login" in url:       return "login"
+    if "/appointments" in url:      return "citas"
+    if "/customReasons" in url:     return "motivos de cita"
+    if "/inspectionItems" in url:   return "puntos/estimates"
+    if "/phases" in url:            return "fases"
+    if "/users?" in url:            return "asesores"
+    if "/orders" in url:
+        return "crear orden" if metodo == "POST" else "consulta de orden"
+    return "otro"
+
+
+def _shop_de_url(url: str):
+    m = re.search(r"repairShopId=(\d+)", url)
+    return int(m.group(1)) if m else None
+
+
+def _registrar(url: str, metodo: str, status: int, ms: int) -> None:
+    """Nunca debe tirar una petición real por un fallo de la bitácora."""
+    try:
+        origen = getattr(_METRICA_LOCAL, "origen", None) or _recurso_de_url(url, metodo)
+        shop = getattr(_METRICA_LOCAL, "shop", None) or _shop_de_url(url)
+        conn = _metrics_conn()
+        conn.execute(
+            "INSERT INTO cm_requests (ts, origen, shop, recurso, metodo, status, ms) VALUES (?,?,?,?,?,?,?)",
+            [time.time(), origen, shop, _recurso_de_url(url, metodo), metodo, int(status), int(ms)],
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
 # ─── Freno de ritmo global hacia ClearMechanic ───────────────────────────────
 # MEDIDO el 12-ago-2026: CM no limita la velocidad instantánea sino el VOLUMEN
 # acumulado en una ventana corta — es una "cubeta" que se rellena a ~1-3
@@ -188,76 +261,73 @@ def _esperar_turno(intervalo: float = _INTERVALO) -> None:
         time.sleep(espera)
 
 
-def _http_post_json(url: str, payload: dict, headers: Optional[dict] = None):
-    """POST JSON con urllib. Devuelve (status_code, texto_respuesta)."""
+def _http_json(url: str, metodo: str, payload: Optional[dict] = None,
+               headers: Optional[dict] = None):
+    """Petición JSON a CM con freno de ritmo y registro en la bitácora.
+    Devuelve (status_code, texto_respuesta)."""
     _esperar_turno()
-    data = json.dumps(payload).encode("utf-8")
-    h = {"Content-Type": "application/json"}
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    h = {"Content-Type": "application/json"} if data is not None else {}
     if headers:
         h.update(headers)
-    req = urllib.request.Request(url, data=data, headers=h, method="POST")
+    req = urllib.request.Request(url, data=data, headers=h, method=metodo)
+    t0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, resp.read().decode("utf-8", errors="replace")
+            status, body = resp.status, resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", errors="replace")
+        status, body = e.code, e.read().decode("utf-8", errors="replace")
     except urllib.error.URLError as e:
-        return 0, str(e)
+        status, body = 0, str(e)
+    _registrar(url, metodo, status, int((time.time() - t0) * 1000))
+    return status, body
+
+
+def _http_post_json(url: str, payload: dict, headers: Optional[dict] = None):
+    return _http_json(url, "POST", payload, headers)
 
 
 def _http_get_json(url: str, headers: Optional[dict] = None):
-    """GET con urllib. Devuelve (status_code, texto_respuesta)."""
-    _esperar_turno()
-    h = dict(headers or {})
-    req = urllib.request.Request(url, headers=h, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as e:
-        return 0, str(e)
+    return _http_json(url, "GET", None, headers)
 
 
 def _http_patch_json(url: str, payload: dict, headers: Optional[dict] = None):
-    """PATCH JSON con urllib. Devuelve (status_code, texto_respuesta)."""
-    _esperar_turno()
-    data = json.dumps(payload).encode("utf-8")
-    h = {"Content-Type": "application/json"}
-    if headers:
-        h.update(headers)
-    req = urllib.request.Request(url, data=data, headers=h, method="PATCH")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as e:
-        return 0, str(e)
+    return _http_json(url, "PATCH", payload, headers)
 
 
-# ─── Token de CM (cacheado) ──────────────────────────────────────────────────
-# El login de CM devuelve expiresIn = 10800 (3 horas). Antes se hacía un login
-# NUEVO en cada petición: eso duplicaba el tráfico contra CM y contribuía a
-# agotar su límite de tasa (HTTP 429 "Rate limit exceeded", que dejaba la
-# pestaña de Inspección sin cargar). Ahora el token se reusa hasta que le
-# queden 5 minutos de vida.
-_TOKEN_CACHE: dict = {"token": None, "exp": 0.0}
+# ─── Token de CM (cacheado, POR CUENTA) ──────────────────────────────────────
+# El login de CM devuelve expiresIn = 10800 (3 horas). El token se reusa hasta
+# que le queden 5 minutos de vida — antes se hacía un login NUEVO por petición
+# y eso duplicaba el tráfico (contribuía al 429).
+# Además hay una cuenta POR SUCURSAL (CM_ACCOUNTS, del .env): cada taller usa
+# la suya para repartir el límite de tasa; sin cuenta propia usa la global.
+_TOKEN_CACHE: dict = {}        # email -> {"token": ..., "exp": ...}
 _TOKEN_LOCK = threading.Lock()
 _TOKEN_MARGIN = 300.0          # renovar 5 min antes de que expire
 
 
-def _cm_login(force: bool = False) -> Optional[str]:
-    """accessToken de CM, reusando el cacheado mientras siga vigente.
-    force=True descarta el cacheado (para reintentar tras un 401)."""
+def _cuenta_para(shop) -> tuple:
+    """(email, password) de la sucursal, o la cuenta global si no tiene."""
+    try:
+        cta = CM_ACCOUNTS.get(int(shop)) if shop else None
+    except (TypeError, ValueError):
+        cta = None
+    return cta if cta else (CM_USER, CM_PASSWORD)
+
+
+def _cm_login(shop=None, force: bool = False) -> Optional[str]:
+    """accessToken de CM para la cuenta de esa sucursal, reusando el cacheado
+    mientras siga vigente. force=True lo descarta (para reintentar tras 401)."""
+    email, password = _cuenta_para(shop)
+    if not email or not password:
+        return None
     now = time.time()
     with _TOKEN_LOCK:
-        if not force and _TOKEN_CACHE["token"] and now < _TOKEN_CACHE["exp"]:
-            return _TOKEN_CACHE["token"]
+        hit = _TOKEN_CACHE.get(email)
+        if not force and hit and now < hit["exp"]:
+            return hit["token"]
 
-        status, body = _http_post_json(
-            CM_LOGIN_URL, {"email": CM_USER, "password": CM_PASSWORD}
-        )
+        status, body = _http_post_json(CM_LOGIN_URL, {"email": email, "password": password})
         if status != 200:
             return None
         try:
@@ -271,8 +341,8 @@ def _cm_login(force: bool = False) -> Optional[str]:
             ttl = float(j.get("expiresIn") or 0)
         except (TypeError, ValueError):
             ttl = 0.0
-        _TOKEN_CACHE["token"] = token
-        _TOKEN_CACHE["exp"]   = now + max(60.0, (ttl or 3600.0) - _TOKEN_MARGIN)
+        _TOKEN_CACHE[email] = {"token": token,
+                               "exp": now + max(60.0, (ttl or 3600.0) - _TOKEN_MARGIN)}
         return token
 
 
@@ -280,12 +350,14 @@ def _cm_login(force: bool = False) -> Optional[str]:
 _CM_GET_RETRIES = (1.5, 4.0)
 
 
-def _cm_get(url: str, token: Optional[str] = None, retries: tuple = _CM_GET_RETRIES):
+def _cm_get(url: str, token: Optional[str] = None, retries: tuple = _CM_GET_RETRIES,
+            shop=None):
     """GET a CM con reintentos ante 429 y renovación del token ante un 401.
-    Devuelve (status, body), igual que _http_get_json.
+    Devuelve (status, body), igual que _http_get_json. `shop` decide qué cuenta
+    se usa (y con cuál se renueva tras un 401).
     `retries` son las esperas entre intentos: acórtalo donde se hagan muchas
     llamadas seguidas (si no, la suma de esperas cuelga la petición)."""
-    tok = token or _cm_login()
+    tok = token or _cm_login(shop)
     if not tok:
         return 0, "No se pudo autenticar en ClearMechanic."
 
@@ -293,7 +365,7 @@ def _cm_get(url: str, token: Optional[str] = None, retries: tuple = _CM_GET_RETR
     status, body = _http_get_json(url, headers)
 
     if status == 401:                       # token vencido/revocado → uno nuevo
-        nuevo = _cm_login(force=True)
+        nuevo = _cm_login(shop, force=True)
         if nuevo:
             headers = {"Authorization": f"Bearer {nuevo}"}
             status, body = _http_get_json(url, headers)
@@ -335,6 +407,7 @@ def _lanzar_refresco(shop: int, ods: list, consultar) -> None:
         _refrescando.add(shop)
 
     def _correr():
+        _origen("alertas Inicio (fondo)", shop)   # hilo propio: etiqueta propia
         try:
             for o in ods:
                 try:
@@ -493,7 +566,8 @@ def create_cm_order(
         payload["customizableFields"] = cfs
 
     # ── 2. Login en CM ───────────────────────────────────────────────────────
-    token = _cm_login()
+    _origen("crear orden", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic (revisa CM_USER/CM_PASSWORD).")
 
@@ -531,6 +605,10 @@ def create_cm_order(
         intentos += 1
 
     if status in (200, 201):
+        # La pestaña de Inspección pudo cachear "no está en CM" hace un momento
+        # (p. ej. al REENVIAR una orden que había fallado): se invalida para que
+        # el cambio se vea de inmediato.
+        _insp_cache_clear(payload["orderNumber"])
         # CM responde 201 Created en éxito. Devuelve algo con un id si viene.
         cm_data = None
         try:
@@ -612,7 +690,8 @@ def list_cm_phases(repairShopId: int):
     if not guid:
         return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
                    f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
-    token = _cm_login()
+    _origen("fases", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
     return {"success": True, "message": None, "data": {"phases": _cm_phases(guid, token)}}
@@ -641,7 +720,8 @@ def patch_cm_order(
         return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
                    f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
 
-    token = _cm_login()
+    _origen("actualizar orden", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
@@ -697,12 +777,13 @@ def get_cm_inspection(folio: str, repairShopId: int):
     if hit and now - hit[0] < _INSP_CACHE_TTL:
         return hit[1]
 
-    token = _cm_login()
+    _origen("pestaña inspección", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
     url = f"{CM_ORDERS_URL}/{urllib.parse.quote(str(folio))}?repairShopId={int(repairShopId)}"
-    status, body = _cm_get(url, token)
+    status, body = _cm_get(url, token, shop=repairShopId)
 
     # La orden todavía no está en CM (no sincronizada / sin inspección hecha).
     if status == 404:
@@ -850,7 +931,8 @@ def create_inspection_item(
     if priority not in _PRIORITY_VALUES:
         return err(400, f"priority inválido '{priority}'. Usa: Low | Med | Urgent.")
 
-    token = _cm_login()
+    _origen("crear punto inspección", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
@@ -905,7 +987,8 @@ def patch_inspection_item(
     if priority is not None and priority not in _PRIORITY_VALUES:
         return err(400, f"priority inválido '{priority}'. Usa: Low | Med | Urgent.")
 
-    token = _cm_login()
+    _origen("editar punto inspección", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
@@ -955,7 +1038,8 @@ def add_inspection_estimates(
     if not items:
         return err(400, "No hay artículos que agregar al punto de inspección.")
 
-    token = _cm_login()
+    _origen("cotizar punto (estimates)", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
@@ -986,13 +1070,7 @@ def add_inspection_estimates(
 
 def _http_delete(url: str, headers: Optional[dict] = None):
     """DELETE con urllib. Devuelve (status_code, texto_respuesta)."""
-    _esperar_turno()
-    req = urllib.request.Request(url, headers=headers or {}, method="DELETE")
-    try:
-        with urllib.request.urlopen(req, timeout=45) as r:
-            return r.status, r.read().decode()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode()
+    return _http_json(url, "DELETE", None, headers)
 
 
 @router.post(
@@ -1017,14 +1095,15 @@ def replace_inspection_estimates(
         return err(400, f"El taller {repairShopId} aún no está configurado para inspección "
                    f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
 
-    token = _cm_login()
+    _origen("sincronizar estimates", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
     headers = {"Authorization": f"Bearer {token}"}
 
     # 1) Estimates actuales del punto (la orden v2 trae parts[] y labors[] con id)
     url = f"{CM_API_BASE}/v2/orders/{urllib.parse.quote(str(folio))}?workshopId={guid}"
-    status, resp = _cm_get(url, token)
+    status, resp = _cm_get(url, token, shop=repairShopId)
     if status != 200:
         return err(502, f"No se pudo leer la orden en ClearMechanic (HTTP {status}).")
     try:
@@ -1129,7 +1208,8 @@ def list_cm_appointments(
     if not dateFrom:
         return err(400, "dateFrom es obligatorio (formato YYYY-MM-DD).")
 
-    token = _cm_login()
+    _origen("citas (listar)", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
@@ -1140,7 +1220,7 @@ def list_cm_appointments(
     if licensePlate: params["licensePlate"] = licensePlate
 
     url = f"{CM_API_BASE}/appointments?{urllib.parse.urlencode(params)}"
-    st, body = _cm_get(url, token)
+    st, body = _cm_get(url, token, shop=repairShopId)
     if st not in (200, 201):
         detail = body
         try:
@@ -1236,7 +1316,8 @@ def create_cm_appointment(
     if not reasons:
         return err(400, "La cita requiere al menos un motivo (customReasons).")
 
-    token = _cm_login()
+    _origen("citas (crear)", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
@@ -1309,13 +1390,14 @@ def list_cm_service_advisors(repairShopId: int):
         return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
                    f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
 
-    token = _cm_login()
+    _origen("asesores CM", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
     params = {"workshopId": guid, "role": "ServiceAdvisor", "pageSize": 200}
     url = f"{CM_API_BASE}/users?{urllib.parse.urlencode(params)}"
-    st, body = _cm_get(url, token)
+    st, body = _cm_get(url, token, shop=repairShopId)
     if st not in (200, 201):
         detail = body
         try:
@@ -1364,7 +1446,8 @@ def link_appointment_to_order(
     if not appt:
         return err(400, "Falta el número de cita (appointmentNumber).")
 
-    token = _cm_login()
+    _origen("ligar cita", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
@@ -1427,12 +1510,13 @@ def list_cm_custom_reasons(repairShopId: int):
         return err(400, f"El taller {repairShopId} aún no está configurado para citas e inspección "
                    f"en ClearMechanic (falta su ID interno). Contacta a soporte.")
 
-    token = _cm_login()
+    _origen("motivos de cita", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
     url = f"{CM_API_BASE}/customReasons?workshopId={guid}"
-    st, body = _cm_get(url, token)
+    st, body = _cm_get(url, token, shop=repairShopId)
     if st not in (200, 201):
         detail = body
         try:
@@ -1543,7 +1627,8 @@ def inspection_alerts(
                 "data": {"alerts": [], "checked": 0}}
 
     # ── 2) Contadores de inspección por orden en CM ─────────────────────────
-    token = _cm_login()
+    _origen("alertas Inicio", repairShopId)
+    token = _cm_login(repairShopId)
     if not token:
         return err(502, "No se pudo autenticar en ClearMechanic.")
 
@@ -1561,7 +1646,7 @@ def inspection_alerts(
         url = f"{CM_ORDERS_URL}/{o['callId']}?repairShopId={int(repairShopId)}"
         # Un solo reintento corto: lo que falle se resuelve en la siguiente
         # pasada del refresco de fondo, no vale la pena esperar aquí.
-        status, body = _cm_get(url, token, retries=(1.5,))
+        status, body = _cm_get(url, token, retries=(1.5,), shop=repairShopId)
         if status == 404:                     # la orden no existe en CM
             _INSP_ALERT_CACHE[key] = (now, None)
             return None
@@ -1643,3 +1728,58 @@ def inspection_alerts(
     return {"success": True, "message": None,
             "data": {"alerts": alerts, "checked": len(ods),
                      "pendientes": len(resto)}}
+
+
+@router.get(
+    "/metrics",
+    summary="Métricas de las peticiones salientes a ClearMechanic (observabilidad)",
+)
+def cm_metrics(hours: int = 24, bucketMin: int = 60):
+    """Agregados de la bitácora local (SQLite) para el Monitor del portal:
+    totales, desglose por origen y por sucursal, y serie de tiempo. `hours`
+    acota la ventana (máx 14 días = la retención); `bucketMin` es el tamaño
+    del punto de la serie en minutos."""
+    hours = max(1, min(int(hours), 14 * 24))
+    bucket = max(5, min(int(bucketMin), 24 * 60)) * 60
+    desde = time.time() - hours * 3600
+
+    try:
+        conn = _metrics_conn()
+        # Retención: al consultar se purga lo viejo (barato y sin cron).
+        conn.execute("DELETE FROM cm_requests WHERE ts < ?", [time.time() - 14 * 86400])
+        conn.commit()
+
+        def q(sql, params):
+            cur = conn.execute(sql, params)
+            cols = [c[0] for c in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+        ok_429_502 = ("SUM(CASE WHEN status BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS ok, "
+                      "SUM(CASE WHEN status = 429 THEN 1 ELSE 0 END) AS e429, "
+                      "SUM(CASE WHEN status = 429 OR status BETWEEN 200 AND 299 "
+                      "         THEN 0 ELSE 1 END) AS otros")
+
+        totales = q(f"SELECT COUNT(*) AS total, {ok_429_502}, "
+                    f"CAST(AVG(ms) AS INTEGER) AS ms_prom "
+                    f"FROM cm_requests WHERE ts >= ?", [desde])[0]
+
+        por_origen = q(f"SELECT origen, COUNT(*) AS total, {ok_429_502} "
+                       f"FROM cm_requests WHERE ts >= ? "
+                       f"GROUP BY origen ORDER BY total DESC", [desde])
+
+        por_sucursal = q(f"SELECT shop, COUNT(*) AS total, {ok_429_502} "
+                         f"FROM cm_requests WHERE ts >= ? "
+                         f"GROUP BY shop ORDER BY total DESC", [desde])
+
+        serie = q(f"SELECT CAST(ts / {bucket} AS INTEGER) * {bucket} AS t, "
+                  f"COUNT(*) AS total, {ok_429_502} "
+                  f"FROM cm_requests WHERE ts >= ? "
+                  f"GROUP BY 1 ORDER BY 1", [desde])
+
+        conn.close()
+        return {"success": True, "message": None,
+                "data": {"hours": hours, "bucketMin": bucket // 60,
+                         "totales": totales, "porOrigen": por_origen,
+                         "porSucursal": por_sucursal, "serie": serie}}
+    except Exception as e:
+        return err(500, f"No se pudieron leer las métricas: {e}")

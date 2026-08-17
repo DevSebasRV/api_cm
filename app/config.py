@@ -40,3 +40,22 @@ CM_LOGIN_URL  = os.getenv("CM_LOGIN_URL",  "https://openapi.somosclear.com/api/u
 CM_ORDERS_URL = os.getenv("CM_ORDERS_URL", "https://openapi.somosclear.com/api/cm/orders")
 CM_USER       = os.getenv("CM_USER")
 CM_PASSWORD   = os.getenv("CM_PASSWORD")
+
+# Cuenta de CM POR SUCURSAL (CM_USER_<repairShopId> / CM_PASSWORD_<repairShopId>
+# en el .env). Si una sucursal no tiene la suya, se usa la cuenta global de
+# arriba — así el sistema funciona igual aunque falte alguna. El objetivo es
+# repartir el límite de tasa de CM entre cuentas (pendiente confirmar con su
+# soporte si el límite es por cuenta; si fuera por IP esto no estorba).
+# 2948=Satélite/FERBEL, 2947=Patriotismo/PROSHOP, 4104=Coapa/SUR, 4105=Tonalá/ROMA.
+CM_ACCOUNTS = {}
+for _shop in (2948, 2947, 4104, 4105):
+    _u = os.getenv(f"CM_USER_{_shop}")
+    _p = os.getenv(f"CM_PASSWORD_{_shop}")
+    if _u and _p:
+        CM_ACCOUNTS[_shop] = (_u, _p)
+
+# Base SQLite con la bitácora de peticiones salientes a CM (observabilidad).
+CM_METRICS_DB = os.getenv(
+    "CM_METRICS_DB",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cm_metrics.db"),
+)
