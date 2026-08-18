@@ -409,6 +409,35 @@ _INSP_CACHE_LOCK = threading.Lock()
 _ALERTAS_LOCK = threading.Lock()
 _alertas_listo = False
 
+# Ventanas del histórico que se revisan en CADA ciclo. Con 3 quincenas por
+# ciclo y ciclos de 15 min, un año de historia queda recorrido en ~2 horas, y
+# cada ciclo cuesta apenas 4 peticiones de lista por taller.
+_VENTANAS_POR_CICLO = 3
+_VENTANA_DIAS = 15
+_MESES_ATRAS = 12          # hasta dónde retrocede el recorrido
+
+# Por dónde va el recorrido de cada taller (avanza un poco en cada ciclo).
+_cursor_ventana: dict = {}
+
+
+def _ventanas_a_revisar(shop: int) -> list:
+    """Siguientes tramos de fecha a revisar de este taller. Va rotando: cuando
+    llega al final del periodo vuelve a empezar, así los cambios sobre órdenes
+    viejas también se acaban detectando."""
+    hoy = datetime.date.today()
+    inicio = hoy - datetime.timedelta(days=_MESES_ATRAS * 30)
+    total = max(1, ((hoy - inicio).days // _VENTANA_DIAS) + 1)
+
+    i = _cursor_ventana.get(shop, 0)
+    ventanas = []
+    for _ in range(_VENTANAS_POR_CICLO):
+        desde = inicio + datetime.timedelta(days=(i % total) * _VENTANA_DIAS)
+        hasta = min(desde + datetime.timedelta(days=_VENTANA_DIAS - 1), hoy)
+        ventanas.append((desde.isoformat(), hasta.isoformat()))
+        i += 1
+    _cursor_ventana[shop] = i % total
+    return ventanas
+
 
 def _alertas_conn():
     global _alertas_listo
@@ -464,20 +493,47 @@ def _puntos_pendientes(data: dict) -> tuple:
 def _barrer_taller(shop: int) -> dict:
     """Un taller: lista sus órdenes, detecta las que cambiaron y baja su detalle.
     Devuelve un resumen para la bitácora del barrido."""
-    _origen("barrido inspecciones", shop)
+    _origen("Revisión automática de inspecciones", shop)
     token = _cm_login(shop)
     if not token:
         return {"error": "no se pudo autenticar"}
 
-    status, body = _cm_get(f"{CM_ORDERS_URL}?repairShopId={int(shop)}", token, shop=shop)
-    if status != 200:
-        return {"error": f"la lista respondió {status}"}
-    try:
-        ordenes = json.loads(body).get("data") or []
-    except Exception:
-        return {"error": "respuesta inválida"}
-    if not isinstance(ordenes, list):
-        return {"error": "la lista no vino como lista"}
+    # LÍMITES DE LA API DE CM (medidos, no supuestos):
+    #   - la lista devuelve máximo 300 órdenes;
+    #   - `page` NO funciona (páginas 2 y 3 traen las mismas 300), ni en v1 ni v2;
+    #   - vienen ordenadas por fecha de CREACIÓN descendente;
+    #   - `dateFrom`+`dateTo` (juntos, obligatorio) SÍ filtran y dan acceso al
+    #     histórico: cada mes consultado devuelve órdenes distintas.
+    # Por eso cada ciclo hace dos cosas: la lista reciente (lo que se acaba de
+    # crear o mover) y unas pocas VENTANAS del pasado, rotando, para que en unas
+    # horas quede cubierto todo sin una sola ráfaga.
+    ordenes = []
+    vistos = set()
+
+    def _listar(url, etiqueta):
+        st, body = _cm_get(url, token, shop=shop)
+        if st != 200:
+            return st
+        try:
+            lote = json.loads(body).get("data") or []
+        except Exception:
+            return 0
+        for o in lote:
+            if isinstance(o, dict):
+                num = str(o.get("orderNumber") or "").strip()
+                if num and num not in vistos:
+                    vistos.add(num)
+                    ordenes.append(o)
+        return st
+
+    st = _listar(f"{CM_ORDERS_URL}?repairShopId={int(shop)}", "recientes")
+    if st != 200:
+        return {"error": f"la lista respondió {st}"}
+
+    for desde, hasta in _ventanas_a_revisar(shop):
+        time.sleep(0.5)
+        _listar(f"{CM_ORDERS_URL}?repairShopId={int(shop)}"
+                f"&dateFrom={desde}&dateTo={hasta}", f"{desde}..{hasta}")
 
     conn = _alertas_conn()
     previos = {r[0]: r[1] for r in
