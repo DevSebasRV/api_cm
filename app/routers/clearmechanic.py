@@ -412,7 +412,12 @@ _alertas_listo = False
 
 def _alertas_conn():
     global _alertas_listo
-    conn = sqlite3.connect(CM_ALERTAS_DB, timeout=10)
+    conn = sqlite3.connect(CM_ALERTAS_DB, timeout=30)
+    # WAL: deja que la tarjeta de Inicio LEA mientras el barrido ESCRIBE. Sin
+    # esto, con varios usuarios consultando durante un barrido salta
+    # "database is locked" (visto en pruebas).
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     if not _alertas_listo:
         with _ALERTAS_LOCK:
             conn.execute("""CREATE TABLE IF NOT EXISTS insp_estado (
@@ -503,6 +508,7 @@ def _barrer_taller(shop: int) -> dict:
             continue
         if previos.get(num) != lut:
             pendientes.append((num, lut, form))
+    conn.commit()      # cerrar la escritura de las "sin inspección" antes del bucle lento
 
     cambiadas = 0
     for num, lut, form in pendientes:
@@ -525,6 +531,9 @@ def _barrer_taller(shop: int) -> dict:
                             puntos=excluded.puntos, revisado=excluded.revisado""",
                      [shop, num, lut, form, yellow, red, json.dumps(puntos), time.time()])
         cambiadas += 1
+        # Confirmar orden por orden: un barrido completo tarda ~100s y dejar la
+        # transacción abierta todo ese rato bloquea a quien quiera leer.
+        conn.commit()
         time.sleep(0.5)          # respiro extra: el barrido nunca corre con prisa
 
     conn.commit()
