@@ -30,7 +30,8 @@ import pyodbc
 import sqlite3
 
 from app.config import (EMPRESAS, CM_LOGIN_URL, CM_ORDERS_URL, CM_USER,
-                        CM_PASSWORD, CM_ACCOUNTS, CM_METRICS_DB)
+                        CM_PASSWORD, CM_ACCOUNTS, CM_METRICS_DB, CM_ALERTAS_DB,
+                        CM_BARRIDO_MIN)
 from app.database import get_connection
 from app.routers.common import err, resolve_db
 
@@ -388,65 +389,194 @@ _INSP_CACHE: dict = {}
 _INSP_CACHE_TTL = 60.0
 _INSP_CACHE_LOCK = threading.Lock()
 
-# Cuántas órdenes NUEVAS se consultan durante la carga de la tarjeta de Inicio.
-# El resto se refresca en segundo plano: así la pantalla no espera y, sobre
-# todo, no se dispara una ráfaga contra CM.
-_ALERTS_POR_CARGA = 5
+# ─── Barrido central de inspecciones ─────────────────────────────────────────
+# ANTES: cada usuario que abría el Inicio disparaba su propio sondeo, orden por
+# orden. Con 50 personas eso se multiplicaba por 50 aunque todas vieran lo
+# mismo, y encima solo cubría las primeras 40 órdenes.
+#
+# AHORA: un solo hilo recorre CM cada CM_BARRIDO_MIN minutos y guarda el estado
+# en SQLite; la tarjeta de Inicio LEE de ahí y no toca CM. El costo ya no
+# depende de cuántos usuarios haya.
+#
+# Cómo detecta lo nuevo (CM no tiene webhooks — verificado: webhooks,
+# subscriptions, events y notifications dan 404):
+#   1. `GET /orders?repairShopId=X` devuelve hasta 300 órdenes en UNA petición,
+#      cada una con `lastUpdatedTime`.
+#   2. Se compara contra lo guardado; solo se pide el detalle de las que
+#      cambiaron (el detalle es el único que trae los contadores rojo/amarillo).
+# Así un ciclo normal cuesta 4 peticiones (una por taller) más las que de
+# verdad cambiaron.
+_ALERTAS_LOCK = threading.Lock()
+_alertas_listo = False
 
-# Talleres con un refresco de fondo en curso (para no lanzar dos a la vez).
-_REFRESCO_LOCK = threading.Lock()
-_refrescando: set = set()
+
+def _alertas_conn():
+    global _alertas_listo
+    conn = sqlite3.connect(CM_ALERTAS_DB, timeout=10)
+    if not _alertas_listo:
+        with _ALERTAS_LOCK:
+            conn.execute("""CREATE TABLE IF NOT EXISTS insp_estado (
+                shop         INTEGER NOT NULL,
+                orden        TEXT    NOT NULL,
+                last_updated TEXT,
+                form_status  TEXT,
+                yellow       INTEGER DEFAULT 0,
+                red          INTEGER DEFAULT 0,
+                puntos       TEXT,
+                revisado     REAL,
+                PRIMARY KEY (shop, orden))""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS barrido (
+                shop INTEGER PRIMARY KEY, ultimo REAL, ordenes INTEGER,
+                cambiadas INTEGER, error TEXT)""")
+            conn.commit()
+            _alertas_listo = True
+    return conn
 
 
-def _lanzar_refresco(shop: int, ods: list, consultar) -> None:
-    """Refresca en segundo plano los contadores que faltan, uno por uno y con
-    un respiro entre cada uno para dejarle cupo de CM a lo interactivo."""
-    with _REFRESCO_LOCK:
-        if shop in _refrescando:
-            return
-        _refrescando.add(shop)
+def _puntos_pendientes(data: dict) -> tuple:
+    """(amarillos, rojos, puntos) que FALTAN POR COTIZAR de una orden de CM.
+    Un punto cotizado es el que ya tiene estimates (parts o labors), que es lo
+    que escribe el portal al cotizarlo; esos no alertan."""
+    yellow = red = 0
+    puntos = []
+    for it in (data.get("inspectionItems") or []):
+        if not isinstance(it, dict):
+            continue
+        pr = (it.get("priority") or "").strip()
+        color = "rojo" if pr == "Urgent" else "amarillo" if pr == "Med" else None
+        if not color:
+            continue
+        if (it.get("parts") or []) or (it.get("labors") or []):
+            continue
+        if color == "rojo":
+            red += 1
+        else:
+            yellow += 1
+        puntos.append({"name": (it.get("inspectionItemName") or "").strip(), "color": color})
+    return yellow, red, puntos
 
-    def _correr():
-        _origen("alertas Inicio (fondo)", shop)   # hilo propio: etiqueta propia
+
+def _barrer_taller(shop: int) -> dict:
+    """Un taller: lista sus órdenes, detecta las que cambiaron y baja su detalle.
+    Devuelve un resumen para la bitácora del barrido."""
+    _origen("barrido inspecciones", shop)
+    token = _cm_login(shop)
+    if not token:
+        return {"error": "no se pudo autenticar"}
+
+    status, body = _cm_get(f"{CM_ORDERS_URL}?repairShopId={int(shop)}", token, shop=shop)
+    if status != 200:
+        return {"error": f"la lista respondió {status}"}
+    try:
+        ordenes = json.loads(body).get("data") or []
+    except Exception:
+        return {"error": "respuesta inválida"}
+    if not isinstance(ordenes, list):
+        return {"error": "la lista no vino como lista"}
+
+    conn = _alertas_conn()
+    previos = {r[0]: r[1] for r in
+               conn.execute("SELECT orden, last_updated FROM insp_estado WHERE shop = ?", [shop])}
+
+    # Solo se pide el detalle de las que cambiaron (o nunca se han visto). Se
+    # omiten las que no tienen inspección: sin formato no hay puntos que cotizar.
+    pendientes = []
+    for o in ordenes:
+        if not isinstance(o, dict):
+            continue
+        num = str(o.get("orderNumber") or "").strip()
+        if not num:
+            continue
+        lut = str(o.get("lastUpdatedTime") or "")
+        form = (o.get("inspectionFormStatus") or "").strip()
+        if form in ("", "UploadedFromOpenAPI"):
+            # Sin inspección todavía: se registra el estado para no volver a
+            # mirarla hasta que CM la toque.
+            conn.execute("""INSERT INTO insp_estado (shop, orden, last_updated, form_status,
+                                yellow, red, puntos, revisado)
+                            VALUES (?,?,?,?,0,0,'[]',?)
+                            ON CONFLICT(shop, orden) DO UPDATE SET
+                                last_updated=excluded.last_updated,
+                                form_status=excluded.form_status,
+                                yellow=0, red=0, puntos='[]', revisado=excluded.revisado""",
+                         [shop, num, lut, form, time.time()])
+            continue
+        if previos.get(num) != lut:
+            pendientes.append((num, lut, form))
+
+    cambiadas = 0
+    for num, lut, form in pendientes:
+        st, cuerpo = _cm_get(f"{CM_ORDERS_URL}/{urllib.parse.quote(num)}?repairShopId={int(shop)}",
+                             token, retries=(2.0,), shop=shop)
+        if st != 200:
+            continue
         try:
-            for o in ods:
-                try:
-                    consultar(o)
-                except Exception:
-                    pass          # una orden que falle no debe cortar el resto
-                time.sleep(1.0)
-        finally:
-            with _REFRESCO_LOCK:
-                _refrescando.discard(shop)
+            data = json.loads(cuerpo).get("data", {}) or {}
+        except Exception:
+            continue
+        yellow, red, puntos = _puntos_pendientes(data)
+        conn.execute("""INSERT INTO insp_estado (shop, orden, last_updated, form_status,
+                            yellow, red, puntos, revisado)
+                        VALUES (?,?,?,?,?,?,?,?)
+                        ON CONFLICT(shop, orden) DO UPDATE SET
+                            last_updated=excluded.last_updated,
+                            form_status=excluded.form_status,
+                            yellow=excluded.yellow, red=excluded.red,
+                            puntos=excluded.puntos, revisado=excluded.revisado""",
+                     [shop, num, lut, form, yellow, red, json.dumps(puntos), time.time()])
+        cambiadas += 1
+        time.sleep(0.5)          # respiro extra: el barrido nunca corre con prisa
 
-    threading.Thread(target=_correr, daemon=True).start()
+    conn.commit()
+    conn.close()
+    return {"ordenes": len(ordenes), "cambiadas": cambiadas}
 
 
-# Contadores de inspección por (taller, folio) para la tarjeta de Inicio.
-# Cada carga de Inicio revisa hasta 40 órdenes en CM: es, por mucho, lo que más
-# consume su límite de tasa. 10 minutos (antes 90s) porque los puntos de
-# inspección no cambian tan seguido Y porque cotizar un punto desde el portal
-# invalida esta caché al instante (_insp_cache_clear), así que el asesor ve su
-# propio cambio sin esperar.
-# Guarda (cuándo_caduca, valor). El TTL es distinto según el caso, ver abajo.
-_INSP_ALERT_CACHE: dict = {}
-_INSP_ALERT_CACHE_TTL = 600.0            # 10 min: la orden SÍ está en CM
+def _barrido_loop():
+    """Hilo único. Espera un poco al arrancar para no competir con el arranque."""
+    time.sleep(45)
+    while True:
+        for shop in sorted(_WORKSHOP_GUID_BY_SHOP):
+            try:
+                r = _barrer_taller(shop)
+                conn = _alertas_conn()
+                conn.execute("""INSERT INTO barrido (shop, ultimo, ordenes, cambiadas, error)
+                                VALUES (?,?,?,?,?)
+                                ON CONFLICT(shop) DO UPDATE SET
+                                    ultimo=excluded.ultimo, ordenes=excluded.ordenes,
+                                    cambiadas=excluded.cambiadas, error=excluded.error""",
+                             [shop, time.time(), r.get("ordenes", 0),
+                              r.get("cambiadas", 0), r.get("error")])
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"[barrido] taller {shop}: {e}")
+            time.sleep(10)       # separa los talleres entre sí
+        time.sleep(max(60, CM_BARRIDO_MIN * 60))
 
-# 6 horas para las órdenes que NO están en CM: eso no cambia por sí solo y era
-# el 93% de las consultas del refresco de fondo (65 de 70, medido en el
-# Monitor). Si la orden se envía a CM, su caché se invalida en ese momento.
-_INSP_NO_EN_CM_TTL = 6 * 3600.0
+
+if CM_USER and CM_PASSWORD:
+    threading.Thread(target=_barrido_loop, daemon=True).start()
 
 
 def _insp_cache_clear(folio) -> None:
-    """Invalida lo cacheado de una orden (tras crear/editar/cotizar un punto),
-    tanto el detalle de la pestaña como los contadores de la tarjeta de Inicio."""
+    """Invalida lo cacheado de una orden tras crear/editar/cotizar un punto.
+
+    Toca dos cosas: el caché de la PESTAÑA de inspección (para que el asesor vea
+    su propio cambio al instante) y el estado del BARRIDO, borrándole el
+    `last_updated` para que el siguiente ciclo vuelva a bajar el detalle de esa
+    orden y la tarjeta de Inicio quede al día."""
     f = str(folio)
     with _INSP_CACHE_LOCK:
         for k in [k for k in _INSP_CACHE if str(k[1]) == f]:
             _INSP_CACHE.pop(k, None)
-        for k in [k for k in _INSP_ALERT_CACHE if str(k[1]) == f]:
-            _INSP_ALERT_CACHE.pop(k, None)
+    try:
+        conn = _alertas_conn()
+        conn.execute("UPDATE insp_estado SET last_updated = NULL WHERE orden = ?", [f])
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass          # el estado del barrido nunca debe tumbar una operación real
 
 
 def _build_order_json(row, phase: str) -> dict:
@@ -1607,8 +1737,10 @@ def inspection_alerts(
                           "JOIN OUBR b ON b.Code = h.branch WHERE b.Name = ?)")
                 params.append(sucursal)
 
+            # Ya no hay tope arbitrario: como no se consulta CM aquí, se pueden
+            # cruzar TODAS las órdenes abiertas del asesor sin costo.
             cursor.execute(
-                f"SELECT TOP {limit} OSCL.callID, OSCL.customer, OSCL.custmrName, OSCL.createDate, "
+                f"SELECT OSCL.callID, OSCL.customer, OSCL.custmrName, OSCL.createDate, "
                 f"       LTRIM(RTRIM(ISNULL(EMP.firstName,'') + ' ' + ISNULL(EMP.lastName,''))) AS AsesorName "
                 f"FROM OSCL LEFT JOIN OHEM EMP ON EMP.empID = OSCL.technician "
                 f"{where} ORDER BY OSCL.callID DESC",
@@ -1632,116 +1764,40 @@ def inspection_alerts(
         return {"success": True, "message": None,
                 "data": {"alerts": [], "checked": 0}}
 
-    # ── 2) Contadores de inspección por orden en CM ─────────────────────────
-    _origen("alertas Inicio", repairShopId)
-    token = _cm_login(repairShopId)
-    if not token:
-        return err(502, "No se pudo autenticar en ClearMechanic.")
+    # ── 2) Cruce con el estado que dejó el BARRIDO CENTRAL ──────────────────
+    # Aquí NO se consulta ClearMechanic: se lee lo que el barrido ya guardó.
+    # Por eso da igual que haya 1 o 50 usuarios abriendo el Inicio a la vez, y
+    # por eso se pueden cruzar todas las órdenes abiertas sin tope.
+    conn = _alertas_conn()
+    estado = {
+        str(r[0]): {"yellow": int(r[1] or 0), "red": int(r[2] or 0), "puntos": r[3]}
+        for r in conn.execute(
+            "SELECT orden, yellow, red, puntos FROM insp_estado "
+            "WHERE shop = ? AND (yellow > 0 OR red > 0)", [int(repairShopId)])
+    }
+    fila = conn.execute("SELECT ultimo FROM barrido WHERE shop = ?",
+                        [int(repairShopId)]).fetchone()
+    conn.close()
+    ultimo_barrido = fila[0] if fila else None
 
-    def _en_cache(call_id):
-        """(hay_dato, valor). valor None = ya revisada y SIN alertas."""
-        hit = _INSP_ALERT_CACHE.get((int(repairShopId), call_id))
-        if hit and time.time() < hit[0]:      # hit[0] = cuándo caduca
-            return True, hit[1]
-        return False, None
-
-    def _consultar(o):
-        """Pregunta a CM por UNA orden y cachea el resultado."""
-        key = (int(repairShopId), o["callId"])
-        now = time.time()
-        url = f"{CM_ORDERS_URL}/{o['callId']}?repairShopId={int(repairShopId)}"
-        # Un solo reintento corto: lo que falle se resuelve en la siguiente
-        # pasada del refresco de fondo, no vale la pena esperar aquí.
-        status, body = _cm_get(url, token, retries=(1.5,), shop=repairShopId)
-        if status == 404:
-            # La orden NO está en CM (nunca se envió, o es anterior a la
-            # integración). Esto no cambia solo, así que se recuerda por horas:
-            # medido en el Monitor, 65 de 70 consultas del refresco de fondo
-            # eran justo esto, repetidas cada 10 min. Si la orden se llega a
-            # enviar a CM, create_cm_order invalida su caché al instante.
-            _INSP_ALERT_CACHE[key] = (now + _INSP_NO_EN_CM_TTL, None)
-            return None
-        if status != 200:                     # error puntual: no cachear
-            return None
-        try:
-            data = json.loads(body).get("data", {}) or {}
-        except Exception:
-            return None
-        # Salida rápida: la orden no tiene ningún punto rojo/amarillo. Aquí SÍ
-        # se usa el TTL corto: en cualquier momento le pueden agregar puntos.
-        if int(data.get("yellowItemsCount") or 0) + int(data.get("redItemsCount") or 0) == 0:
-            _INSP_ALERT_CACHE[key] = (now + _INSP_ALERT_CACHE_TTL, None)
-            return None
-
-        # Solo alertan los puntos rojos/amarillos que FALTA COTIZAR: en CM un
-        # punto cotizado es el que ya tiene estimates (parts o labors), que es
-        # justo lo que escribe el portal al cotizarlo. Los contadores se
-        # recalculan con los pendientes (los de CM incluyen los ya cotizados).
-        yellow = 0
-        red    = 0
-        points = []
-        for it in (data.get("inspectionItems") or []):
-            if not isinstance(it, dict):
-                continue
-            pr = (it.get("priority") or "").strip()
-            if pr == "Urgent":
-                color = "rojo"
-            elif pr == "Med":
-                color = "amarillo"
-            else:
-                continue
-            if (it.get("parts") or []) or (it.get("labors") or []):
-                continue                      # ya cotizado → no alerta
-            if color == "rojo":
-                red += 1
-            else:
-                yellow += 1
-            points.append({"name": (it.get("inspectionItemName") or "").strip(),
-                           "color": color})
-
-        if yellow + red == 0:                 # todos los puntos ya están cotizados
-            _INSP_ALERT_CACHE[key] = (now + _INSP_ALERT_CACHE_TTL, None)
-            return None
-
-        base = {"yellow": yellow, "red": red, "points": points,
-                "lastUpdatedTime": data.get("lastUpdatedTime")}
-        _INSP_ALERT_CACHE[key] = (now + _INSP_ALERT_CACHE_TTL, base)
-        return {**o, **base}
-
-    # ── 3) Servir de caché + refrescar el resto en segundo plano ────────────
-    # ANTES esto pedía hasta 40 órdenes de golpe con 3 hilos (~16 peticiones/s):
-    # esa ráfaga vaciaba el cupo de CM y dejaba a TODOS con 429 durante medio
-    # minuto — incluido el asesor que solo abría la pestaña de Inspección de una
-    # ODS. Ahora lo cacheado sale al instante, se consultan unas pocas nuevas y
-    # las demás se refrescan despacio por detrás, sin hacer esperar a nadie.
-    alerts     = []
-    pendientes = []
+    alerts = []
     for o in ods:
-        hay, base = _en_cache(o["callId"])
-        if hay:
-            if base:
-                alerts.append({**o, **base})
-        else:
-            pendientes.append(o)
+        e = estado.get(str(o["callId"]))
+        if not e:
+            continue
+        try:
+            puntos = json.loads(e["puntos"] or "[]")
+        except Exception:
+            puntos = []
+        alerts.append({**o, "yellow": e["yellow"], "red": e["red"], "points": puntos})
 
-    for o in pendientes[:_ALERTS_POR_CARGA]:
-        alerta = _consultar(o)
-        if alerta:
-            alerts.append(alerta)
-
-    resto = pendientes[_ALERTS_POR_CARGA:]
-    if resto:
-        _lanzar_refresco(int(repairShopId), resto, _consultar)
-
-    # De la ODS más nueva a la más vieja, por FECHA DE LA ORDEN (pedido del
-    # cliente; antes era por última actualización de la inspección en CM).
+    # De la ODS más nueva a la más vieja, por FECHA DE LA ORDEN.
     alerts.sort(key=lambda a: (a.get("fecha") or "", a.get("callId") or 0), reverse=True)
 
-    # `pendientes` = órdenes que aún no se han revisado en esta ronda; aparecerán
-    # en las siguientes cargas conforme el refresco de fondo las vaya llenando.
     return {"success": True, "message": None,
             "data": {"alerts": alerts, "checked": len(ods),
-                     "pendientes": len(resto)}}
+                     "pendientes": 0,
+                     "ultimoBarrido": ultimo_barrido}}
 
 
 @router.get(

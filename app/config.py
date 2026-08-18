@@ -59,3 +59,16 @@ CM_METRICS_DB = os.getenv(
     "CM_METRICS_DB",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cm_metrics.db"),
 )
+
+# Base SQLite con el estado de las inspecciones (lo que produce el barrido
+# central y lee la tarjeta de Inicio). Va en un ARCHIVO APARTE del de métricas:
+# SQLite bloquea por archivo y las métricas escriben en cada petición.
+CM_ALERTAS_DB = os.getenv(
+    "CM_ALERTAS_DB",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cm_alertas.db"),
+)
+
+# Cada cuántos minutos corre el barrido central de inspecciones. Es UNO para
+# todo el portal, no por usuario: con 50 personas conectadas el costo es el
+# mismo que con una.
+CM_BARRIDO_MIN = int(os.getenv("CM_BARRIDO_MIN", "15"))
