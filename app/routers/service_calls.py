@@ -1142,6 +1142,65 @@ def surtido_pendiente(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get(
+    "/lastKm",
+    summary="Último kilometraje registrado de un equipo (para validar la ODS nueva)",
+)
+def last_km(
+    insId:    Optional[int] = Query(default=None, description="insID de la tarjeta de equipo (OINS)"),
+    vin:      Optional[str] = Query(default=None, description="Número de serie interno, si no hay tarjeta"),
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    """Kilometraje de la ODS más reciente de ese equipo, para que el portal no
+    deje capturar uno menor.
+
+    Se busca por TARJETA DE EQUIPO (OSCL.insID) porque es el identificador
+    confiable: los VIN traen comodines históricos compartidos por cientos de
+    órdenes ('REVISONDEUNIDADES', '123456789'). Si no hay tarjeta se cae al VIN,
+    pero solo si parece uno real (17 caracteres) — con un comodín se devuelve
+    vacío para no bloquear trabajos internos.
+
+    `U_KM` es entero en OSCL; se usa TRY_CAST por si alguna fila trae basura."""
+    if not insId and not (vin or "").strip():
+        return err(400, "Falta insId o vin.")
+
+    _, database = resolve_db(x_sap_db)
+    if insId:
+        cond, params = "o.insID = ?", [int(insId)]
+    else:
+        v = (vin or "").strip()
+        if len(v) != 17:          # comodín: no hay histórico confiable
+            return {"success": True, "data": {"km": None, "callId": None, "fecha": None}}
+        cond, params = "LTRIM(RTRIM(ISNULL(o.internalSN,''))) = ?", [v]
+
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                SELECT TOP 1 o.callID, TRY_CAST(o.U_KM AS INT) AS km, o.createDate
+                FROM   OSCL o
+                WHERE  {cond} AND TRY_CAST(o.U_KM AS INT) IS NOT NULL
+                ORDER BY TRY_CAST(o.U_KM AS INT) DESC, o.callID DESC
+                """,
+                params,
+            )
+            r = cursor.fetchone()
+            if not r:
+                return {"success": True, "data": {"km": None, "callId": None, "fecha": None}}
+            return {"success": True, "data": {
+                "km":     int(r.km),
+                "callId": int(r.callID),
+                "fecha":  r.createDate.date().isoformat() if r.createDate else None,
+            }}
+        finally:
+            cursor.close()
+            conn.close()
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
+
+
+@router.get(
     "/serialLookup",
     summary="Busca un equipo por número de serie (manufactura, interno, distribución o proveedor)",
 )
