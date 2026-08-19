@@ -68,6 +68,18 @@ _DEFAULT_PHASE_BY_SHOP = {
 # SATELITE/PATRIOTISMO) NO coinciden con los del portal (TONALÁ/COAPA/FERBEL/
 # PROSHOP). El código usa el NÚMERO, así que la discrepancia de nombres es solo
 # cosmética.
+# De qué EMPRESA de SAP y de qué SUCURSAL (OUBR.Name) es cada taller de CM.
+# Lo necesita el barrido para preguntarle a SAP cuáles ODS están abiertas.
+# OJO: los nombres NO coinciden entre sistemas — CM llama SATELITE/PATRIOTISMO/
+# SUR/ROMA a lo que SAP nombra Satélite/Patriotismo/Miramontes_Sur/Tonala.
+_EMPRESA_DE_TALLER = {2948: "fn", 2947: "fn", 4104: "fn", 4105: "fn"}
+_SUCURSAL_DE_TALLER = {
+    2948: "Satélite",
+    2947: "Patriotismo",
+    4104: "Miramontes_Sur",
+    4105: "Tonala",
+}
+
 _WORKSHOP_GUID_BY_SHOP = {
     4105: "5950971e-41c4-4202-bf54-8b4514768163",   # TONALÁ  (CM: "ROMA")
     4104: "64e4cbbe-18c2-428e-9386-511ddc5b034f",   # COAPA   (CM: "SUR")
@@ -409,34 +421,45 @@ _INSP_CACHE_LOCK = threading.Lock()
 _ALERTAS_LOCK = threading.Lock()
 _alertas_listo = False
 
-# Ventanas del histórico que se revisan en CADA ciclo. Con 3 quincenas por
-# ciclo y ciclos de 15 min, un año de historia queda recorrido en ~2 horas, y
-# cada ciclo cuesta apenas 4 peticiones de lista por taller.
-_VENTANAS_POR_CICLO = 3
-_VENTANA_DIAS = 15
-_MESES_ATRAS = 12          # hasta dónde retrocede el recorrido
-
-# Por dónde va el recorrido de cada taller (avanza un poco en cada ciclo).
-_cursor_ventana: dict = {}
+# Cuántas ODS abiertas se consultan por ciclo cuando hay que ir a CM una por
+# una. Con 60 por taller y ciclos de 15 min, las ~640 abiertas de la sucursal
+# más grande quedan cubiertas en ~2.5 h, y luego solo se revisa lo que cambia.
+_ODS_POR_CICLO = 60
 
 
-def _ventanas_a_revisar(shop: int) -> list:
-    """Siguientes tramos de fecha a revisar de este taller. Va rotando: cuando
-    llega al final del periodo vuelve a empezar, así los cambios sobre órdenes
-    viejas también se acaban detectando."""
-    hoy = datetime.date.today()
-    inicio = hoy - datetime.timedelta(days=_MESES_ATRAS * 30)
-    total = max(1, ((hoy - inicio).days // _VENTANA_DIAS) + 1)
+def _ods_abiertas_de(shop: int) -> list:
+    """Las ODS ABIERTAS de este taller, según SAP.
 
-    i = _cursor_ventana.get(shop, 0)
-    ventanas = []
-    for _ in range(_VENTANAS_POR_CICLO):
-        desde = inicio + datetime.timedelta(days=(i % total) * _VENTANA_DIAS)
-        hasta = min(desde + datetime.timedelta(days=_VENTANA_DIAS - 1), hoy)
-        ventanas.append((desde.isoformat(), hasta.isoformat()))
-        i += 1
-    _cursor_ventana[shop] = i % total
-    return ventanas
+    Antes el barrido recorría el histórico de CM a ciegas por ventanas de fecha
+    y era un mal negocio: guardaba 13,000 órdenes (casi todas cerradas) y aun
+    así solo cubría la mitad de las abiertas, porque cada ventana tope a 300 y
+    lo que sobraba se perdía. SAP ya sabe exactamente cuáles importan, así que
+    la lista sale de aquí y CM solo se consulta para esas."""
+    empresa = _EMPRESA_DE_TALLER.get(int(shop))
+    if not empresa:
+        return []
+    try:
+        _, database = resolve_db(empresa)
+        conn = get_connection(database)
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT o.callID
+                FROM   OSCL o
+                LEFT   JOIN OHEM h ON h.empID = o.technician
+                LEFT   JOIN OUBR b ON b.Code  = h.branch
+                WHERE  o.closeDate IS NULL AND b.Name = ?
+                """,
+                [_SUCURSAL_DE_TALLER.get(int(shop), "")],
+            )
+            return [str(r.callID) for r in cur.fetchall()]
+        finally:
+            cur.close()
+            conn.close()
+    except Exception as e:
+        print(f"[barrido] no se pudieron leer las ODS abiertas del taller {shop}: {e}")
+        return []
 
 
 def _alertas_conn():
@@ -498,73 +521,62 @@ def _barrer_taller(shop: int) -> dict:
     if not token:
         return {"error": "no se pudo autenticar"}
 
-    # LÍMITES DE LA API DE CM (medidos, no supuestos):
-    #   - la lista devuelve máximo 300 órdenes;
-    #   - `page` NO funciona (páginas 2 y 3 traen las mismas 300), ni en v1 ni v2;
-    #   - vienen ordenadas por fecha de CREACIÓN descendente;
-    #   - `dateFrom`+`dateTo` (juntos, obligatorio) SÍ filtran y dan acceso al
-    #     histórico: cada mes consultado devuelve órdenes distintas.
-    # Por eso cada ciclo hace dos cosas: la lista reciente (lo que se acaba de
-    # crear o mover) y unas pocas VENTANAS del pasado, rotando, para que en unas
-    # horas quede cubierto todo sin una sola ráfaga.
-    ordenes = []
-    vistos = set()
+    # El universo lo define SAP: SOLO las ODS abiertas de este taller.
+    abiertas = _ods_abiertas_de(shop)
+    if not abiertas:
+        return {"ordenes": 0, "cambiadas": 0}
 
-    def _listar(url, etiqueta):
-        st, body = _cm_get(url, token, shop=shop)
-        if st != 200:
-            return st
+    # La lista de CM (1 petición, hasta 300 por fecha de creación descendente)
+    # sirve para detectar cambios BARATO: trae `lastUpdatedTime` de lo reciente.
+    # Lo que no venga en ella se consulta una por una, por turnos.
+    lut_lista = {}
+    form_lista = {}
+    st, body = _cm_get(f"{CM_ORDERS_URL}?repairShopId={int(shop)}", token, shop=shop)
+    if st == 200:
         try:
-            lote = json.loads(body).get("data") or []
+            for o in (json.loads(body).get("data") or []):
+                if isinstance(o, dict):
+                    num = str(o.get("orderNumber") or "").strip()
+                    if num:
+                        lut_lista[num] = str(o.get("lastUpdatedTime") or "")
+                        form_lista[num] = (o.get("inspectionFormStatus") or "").strip()
         except Exception:
-            return 0
-        for o in lote:
-            if isinstance(o, dict):
-                num = str(o.get("orderNumber") or "").strip()
-                if num and num not in vistos:
-                    vistos.add(num)
-                    ordenes.append(o)
-        return st
-
-    st = _listar(f"{CM_ORDERS_URL}?repairShopId={int(shop)}", "recientes")
-    if st != 200:
-        return {"error": f"la lista respondió {st}"}
-
-    for desde, hasta in _ventanas_a_revisar(shop):
-        time.sleep(0.5)
-        _listar(f"{CM_ORDERS_URL}?repairShopId={int(shop)}"
-                f"&dateFrom={desde}&dateTo={hasta}", f"{desde}..{hasta}")
+            pass
 
     conn = _alertas_conn()
-    previos = {r[0]: r[1] for r in
-               conn.execute("SELECT orden, last_updated FROM insp_estado WHERE shop = ?", [shop])}
+    previos = {r[0]: (r[1], r[2]) for r in conn.execute(
+        "SELECT orden, last_updated, revisado FROM insp_estado WHERE shop = ?", [shop])}
 
-    # Solo se pide el detalle de las que cambiaron (o nunca se han visto). Se
-    # omiten las que no tienen inspección: sin formato no hay puntos que cotizar.
-    pendientes = []
-    for o in ordenes:
-        if not isinstance(o, dict):
-            continue
-        num = str(o.get("orderNumber") or "").strip()
-        if not num:
-            continue
-        lut = str(o.get("lastUpdatedTime") or "")
-        form = (o.get("inspectionFormStatus") or "").strip()
-        if form in ("", "UploadedFromOpenAPI"):
-            # Sin inspección todavía: se registra el estado para no volver a
-            # mirarla hasta que CM la toque.
-            conn.execute("""INSERT INTO insp_estado (shop, orden, last_updated, form_status,
-                                yellow, red, puntos, revisado)
-                            VALUES (?,?,?,?,0,0,'[]',?)
-                            ON CONFLICT(shop, orden) DO UPDATE SET
-                                last_updated=excluded.last_updated,
-                                form_status=excluded.form_status,
-                                yellow=0, red=0, puntos='[]', revisado=excluded.revisado""",
-                         [shop, num, lut, form, time.time()])
-            continue
-        if previos.get(num) != lut:
-            pendientes.append((num, lut, form))
-    conn.commit()      # cerrar la escritura de las "sin inspección" antes del bucle lento
+    pendientes = []       # hay que bajarles el detalle a CM
+    for num in abiertas:
+        if num in lut_lista:
+            # Está en la lista reciente: se sabe si cambió sin gastar peticiones.
+            lut, form = lut_lista[num], form_lista.get(num, "")
+            if form in ("", "UploadedFromOpenAPI"):
+                conn.execute("""INSERT INTO insp_estado (shop, orden, last_updated, form_status,
+                                    yellow, red, puntos, revisado)
+                                VALUES (?,?,?,?,0,0,'[]',?)
+                                ON CONFLICT(shop, orden) DO UPDATE SET
+                                    last_updated=excluded.last_updated,
+                                    form_status=excluded.form_status,
+                                    yellow=0, red=0, puntos='[]', revisado=excluded.revisado""",
+                             [shop, num, lut, form, time.time()])
+                continue
+            if previos.get(num, ("", 0))[0] != lut:
+                pendientes.append((num, lut, form))
+        elif num not in previos:
+            pendientes.append((num, "", ""))      # nunca revisada
+        else:
+            pendientes.append((num, None, None))  # toca refrescarla por turno
+
+    conn.commit()      # cerrar estas escrituras antes del bucle lento
+
+    # Prioridad: primero las que nunca se han revisado, luego las más rezagadas.
+    # Así la cobertura sube rápido y después se mantiene sola.
+    nunca   = [p for p in pendientes if p[0] not in previos]
+    viejas  = sorted((p for p in pendientes if p[0] in previos),
+                     key=lambda p: previos.get(p[0], ("", 0))[1] or 0)
+    pendientes = (nunca + viejas)[:_ODS_POR_CICLO]
 
     cambiadas = 0
     for num, lut, form in pendientes:
@@ -576,6 +588,10 @@ def _barrer_taller(shop: int) -> dict:
             data = json.loads(cuerpo).get("data", {}) or {}
         except Exception:
             continue
+        # Cuando la orden no venía en la lista reciente no se sabe su fecha de
+        # cambio ni su estado: se toman del propio detalle.
+        lut  = lut  or str(data.get("lastUpdatedTime") or "")
+        form = form or (data.get("inspectionFormStatus") or "").strip()
         yellow, red, puntos = _puntos_pendientes(data)
         conn.execute("""INSERT INTO insp_estado (shop, orden, last_updated, form_status,
                             yellow, red, puntos, revisado)
@@ -587,14 +603,14 @@ def _barrer_taller(shop: int) -> dict:
                             puntos=excluded.puntos, revisado=excluded.revisado""",
                      [shop, num, lut, form, yellow, red, json.dumps(puntos), time.time()])
         cambiadas += 1
-        # Confirmar orden por orden: un barrido completo tarda ~100s y dejar la
-        # transacción abierta todo ese rato bloquea a quien quiera leer.
+        # Confirmar orden por orden: dejar la transacción abierta todo el ciclo
+        # bloquea a quien quiera leer la tarjeta de Inicio.
         conn.commit()
         time.sleep(0.5)          # respiro extra: el barrido nunca corre con prisa
 
     conn.commit()
     conn.close()
-    return {"ordenes": len(ordenes), "cambiadas": cambiadas}
+    return {"ordenes": len(abiertas), "cambiadas": cambiadas}
 
 
 def _barrido_loop():
