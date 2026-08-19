@@ -554,6 +554,9 @@ def _fetch_document(cursor, obj_type: int, doc_entry: int) -> Optional[Dict[str,
         "DocDate":    h.DocDate.isoformat() if h.DocDate else None,
         "DocStatus":  h.DocStatus,            # 'O' (abierto) | 'C' (cerrado)
         "DocStatusLabel": LINE_STATUS_MAP.get(h.DocStatus, h.DocStatus or ""),
+        # Ligado DIRECTAMENTE a la orden de servicio, o solo alcanzable por la
+        # cadena de documentos. Lo decide _fetch_related_documents.
+        "LinkedDirect": False,
         "DocTotal":   float(h.DocTotal) if h.DocTotal is not None else 0.0,
         "DocCurrency": h.DocCur,
         "CardCode":   h.CardCode,
@@ -631,6 +634,7 @@ def _fetch_related_documents(
                     continue
                 doc = _fetch_document(cursor, obj_type, int(r.DocEntry))
                 if doc:
+                    doc["LinkedDirect"] = True     # apunta a la ODS en sus líneas
                     grouped[type_label].append(doc)
                     seen.add(key)
         except pyodbc.Error:
@@ -658,6 +662,7 @@ def _fetch_related_documents(
                 continue
             doc = _fetch_document(cursor, obj_type, int(r.DocAbs))
             if doc:
+                doc["LinkedDirect"] = True    # está en la grilla de la ODS en SAP
                 grouped[type_label].append(doc)
                 seen.add(key)
     except pyodbc.Error:
@@ -668,6 +673,11 @@ def _fetch_related_documents(
     # fechas, así que liga las ofertas aunque la orden ya tenga closeDate y el
     # documento se haya creado DESPUÉS de esa fecha. Lo estampan las acciones
     # del portal (crear oferta, convertir a entrega) en Comments.
+    #
+    # OJO: esto NO es una liga de SAP. Un documento que solo llega hasta aquí
+    # aparece por su comentario o por la cadena (oferta → entrega → factura),
+    # pero NO está colgado de la orden de servicio: en SAP, la ODS no lo
+    # conoce. Quedan con LinkedDirect=False y el portal los marca en rojo.
     marker_like = f"%ODS #{call_id}%"
     # Evita que, p.ej., la orden 7006 capture documentos de la 70065.
     marker_re = re.compile(rf"ODS\s*#?\s*{call_id}(?:\D|$)")
