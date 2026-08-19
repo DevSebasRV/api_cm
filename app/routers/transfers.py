@@ -354,21 +354,17 @@ def list_transfers_done(
         return err(500, f"Error interno: {e}")
 
 
-@router.get(
-    "/transferRequests/{doc_entry}/ticket",
-    summary="Datos del ticket térmico de una solicitud de traslado",
-)
-def transfer_request_ticket(
-    doc_entry: int,
-    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
-):
-    _, database = resolve_db(x_sap_db)
+def _ticket_traslado(doc_entry: int, database: str, cabecera: str, lineas_tbl: str,
+                     etiqueta: str):
+    """Datos del ticket térmico. Sirve igual para la SOLICITUD (OWTQ/WTQ1) y para
+    el TRASLADO ya hecho (OWTR/WTR1): las dos tablas tienen la misma forma —
+    Filler es el almacén origen, ToWhsCode el destino."""
     try:
         conn   = get_connection(database)
         cursor = conn.cursor()
         try:
             cursor.execute(
-                """
+                f"""
                 SELECT  q.DocEntry, q.DocNum, q.DocDate, q.DocStatus, q.CANCELED,
                         q.Comments, q.U_ODS, q.SlpCode,
                         s.SlpName,
@@ -376,7 +372,7 @@ def transfer_request_ticket(
                         wf.WhsName  AS FromWhsName,
                         q.ToWhsCode AS ToWhs,
                         wt.WhsName  AS ToWhsName
-                FROM    OWTQ q
+                FROM    {cabecera} q
                 LEFT    JOIN OSLP s  ON s.SlpCode  = q.SlpCode
                 LEFT    JOIN OWHS wf ON wf.WhsCode = q.Filler
                 LEFT    JOIN OWHS wt ON wt.WhsCode = q.ToWhsCode
@@ -386,13 +382,13 @@ def transfer_request_ticket(
             )
             h = cursor.fetchone()
             if not h:
-                return err(404, f"La solicitud de traslado {doc_entry} no existe.")
+                return err(404, f"{etiqueta} {doc_entry} no existe.")
 
             cursor.execute(
-                """
+                f"""
                 SELECT  LineNum, ItemCode, Dscription, Quantity,
                         FromWhsCod, WhsCode
-                FROM    WTQ1
+                FROM    {lineas_tbl}
                 WHERE   DocEntry = ?
                 ORDER BY LineNum
                 """,
@@ -445,3 +441,29 @@ def transfer_request_ticket(
         return err(500, f"Error de SAP B1: {db_err}")
     except Exception as e:
         return err(500, f"Error interno: {e}")
+
+
+@router.get(
+    "/transferRequests/{doc_entry}/ticket",
+    summary="Datos del ticket térmico de una solicitud de traslado",
+)
+def transfer_request_ticket(
+    doc_entry: int,
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    _, database = resolve_db(x_sap_db)
+    return _ticket_traslado(doc_entry, database, "OWTQ", "WTQ1",
+                            "La solicitud de traslado")
+
+
+@router.get(
+    "/transfersDone/{doc_entry}/ticket",
+    summary="Datos del ticket térmico de un traslado ya realizado",
+)
+def transfer_done_ticket(
+    doc_entry: int,
+    x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB"),
+):
+    _, database = resolve_db(x_sap_db)
+    return _ticket_traslado(doc_entry, database, "OWTR", "WTR1",
+                            "El traslado")
