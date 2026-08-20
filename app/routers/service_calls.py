@@ -1677,6 +1677,25 @@ def list_customer_equipment(
         return err(500, f"Error interno: {e}")
 
 
+# Mano de obra = grupo de artículos "Taller Servicio". El PRECIO de estos NO se
+# edita en el portal: es tarifa, no negociación, y de ahí sale el destajo del
+# mecánico.
+#
+# El código del grupo es 125 en las dos empresas, pero el NOMBRE no coincide
+# ("Taller Servicio" en Ferbel, "* TALLER SERVICIO" en Proshop), así que se
+# compara el nombre sin espacios ni asteriscos y además se acepta el 125. Con
+# cualquiera de las dos señales basta.
+#
+# NO se puede filtrar por el prefijo MO-: de los 5,697 artículos del grupo en
+# Ferbel, solo 75 empiezan así. El resto son códigos como .AKIRA o .AN125.
+_ES_MANO_DE_OBRA_SQL = """
+    CASE WHEN OITM.ItmsGrpCod = 125
+           OR REPLACE(REPLACE(UPPER(ISNULL(OITB.ItmsGrpNam,'')), ' ', ''), '*', '')
+              = 'TALLERSERVICIO'
+         THEN 1 ELSE 0 END
+"""
+
+
 @router.get(
     "/quoteArticleSearch",
     summary="Busca artículos por código o nombre (con precio de lista) para armar ofertas",
@@ -1709,8 +1728,10 @@ def quote_article_search(
             OITM.ItemName,
             OITM.OnHand,
             ISNULL(ITM1.Price, 0)  AS Price,
-            ISNULL(OITW.OnHand, 0) AS OnHandWhs
+            ISNULL(OITW.OnHand, 0) AS OnHandWhs,
+            {_ES_MANO_DE_OBRA_SQL} AS ManoObra
         FROM   OITM
+        LEFT   JOIN OITB ON OITB.ItmsGrpCod = OITM.ItmsGrpCod
         LEFT   JOIN ITM1 ON ITM1.ItemCode = OITM.ItemCode AND ITM1.PriceList = ?
         LEFT   JOIN OITW ON OITW.ItemCode = OITM.ItemCode AND OITW.WhsCode = ?
         WHERE  ISNULL(OITM.Canceled,'N') = 'N'
@@ -1741,6 +1762,7 @@ def quote_article_search(
                     "Price":     float(r.Price)     if r.Price     is not None else 0.0,
                     "OnHand":    float(r.OnHand)    if r.OnHand    is not None else 0.0,
                     "OnHandWhs": float(r.OnHandWhs) if r.OnHandWhs is not None else 0.0,
+                    "ManoObra":  bool(r.ManoObra),
                 }
                 for r in cursor.fetchall()
             ]
@@ -1857,9 +1879,14 @@ def kit_components(
     _, database = resolve_db(x_sap_db)
     sql = """
         SELECT C.Code, C.Quantity, C.Price AS BomPrice, C.Warehouse,
-               O.ItemName, ISNULL(I.Price, 0) AS ListPrice
+               O.ItemName, ISNULL(I.Price, 0) AS ListPrice,
+               CASE WHEN O.ItmsGrpCod = 125
+                      OR REPLACE(REPLACE(UPPER(ISNULL(B.ItmsGrpNam,'')), ' ', ''), '*', '')
+                         = 'TALLERSERVICIO'
+                    THEN 1 ELSE 0 END AS ManoObra
         FROM   ITT1 C
         LEFT   JOIN OITM O ON O.ItemCode = C.Code
+        LEFT   JOIN OITB B ON B.ItmsGrpCod = O.ItmsGrpCod
         LEFT   JOIN ITM1 I ON I.ItemCode = C.Code AND I.PriceList = ?
         WHERE  C.Father = ?
         ORDER BY C.ChildNum
@@ -1879,6 +1906,7 @@ def kit_components(
                     "Quantity":  float(r.Quantity) if r.Quantity is not None else 1.0,
                     "Price":     bom if bom > 0 else lst,
                     "Warehouse": r.Warehouse,
+                    "ManoObra":  bool(r.ManoObra),
                 })
         finally:
             cursor.close()
@@ -2039,8 +2067,6 @@ def salespersons(
 # SAP, y no se ofrece algo que reventaría al guardar. En Proshop estos mismos
 # códigos significan ANTICIPO en vez de ALTA; por eso el nombre sale de SAP.
 _ARTICULOS_ALTA = ("AP", "AS", "AM", "AT", "AY")
-
-
 @router.get(
     "/altaItems",
     summary="Artículos de alta (AP/AS/AM/AT/AY) que existen en la empresa",
