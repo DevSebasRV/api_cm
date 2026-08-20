@@ -2026,3 +2026,51 @@ def salespersons(
                 "sucursalResuelta": localidad}
     except pyodbc.Error as db_err:
         return err(500, f"Error de SAP B1: {db_err}")
+
+
+# Artículos de "alta": sirven para cotizar una refacción que NO está en el
+# catálogo. El asesor los usa poniendo los datos de la pieza en la descripción
+# de la línea, separados por *. SAP conserva esa descripción propia (verificado:
+# 64,300 líneas así, todas creadas por Service Layer, que es por donde escribe
+# el portal).
+#
+# La lista es de CANDIDATOS, no fija: se devuelven solo los que existen de
+# verdad en la empresa consultada. Así AT aparece solo el día que lo creen en
+# SAP, y no se ofrece algo que reventaría al guardar. En Proshop estos mismos
+# códigos significan ANTICIPO en vez de ALTA; por eso el nombre sale de SAP.
+_ARTICULOS_ALTA = ("AP", "AS", "AM", "AT", "AY")
+
+
+@router.get(
+    "/altaItems",
+    summary="Artículos de alta (AP/AS/AM/AT/AY) que existen en la empresa",
+)
+def alta_items(x_sap_db: Optional[str] = Header(default=None, alias="X-SAP-DB")):
+    _, database = resolve_db(x_sap_db)
+    marcadores = ",".join("?" * len(_ARTICULOS_ALTA))
+    try:
+        conn   = get_connection(database)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                SELECT  ItemCode, ItemName
+                FROM    OITM
+                WHERE   ItemCode IN ({marcadores})
+                  AND   ISNULL(SellItem, 'Y')  = 'Y'
+                  AND   ISNULL(frozenFor, 'N') <> 'Y'
+                ORDER BY ItemCode
+                """,
+                list(_ARTICULOS_ALTA),
+            )
+            items = [
+                {"ItemCode": (r.ItemCode or "").strip(),
+                 "ItemName": (r.ItemName or "").strip()}
+                for r in cursor.fetchall()
+            ]
+        finally:
+            cursor.close()
+            conn.close()
+        return {"success": True, "items": items}
+    except pyodbc.Error as db_err:
+        return err(500, f"Error de SAP B1: {db_err}")
